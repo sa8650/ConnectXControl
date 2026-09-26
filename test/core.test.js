@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   signToken, verifyToken, hashPassword, checkPassword, pairingCode,
-  cleanPhone, dayStart, fillTemplate, templateVars, workspaceCode, isPackage, isVersion
+  cleanPhone, dayStart, fillTemplate, templateVars, isPackage, isVersion
 } from '../functions/_lib/core.js';
 
 const SECRET = 'unit-test-secret';
@@ -59,12 +59,6 @@ test('templates fill placeholders', () => {
   const vars = templateVars('Dhaka Main', { name: 'Rahim', invoice: 'INV-9', total: 5400, paid: 5000, due: 400 });
   const out = fillTemplate('Hi {name}, thanks for your purchase at {shop}. Invoice {invoice}: total {currency} {total}, due {currency} {due}.', vars);
   assert.equal(out, 'Hi Rahim, thanks for your purchase at Dhaka Main. Invoice INV-9: total BDT 5,400.00, due BDT 400.00.');
-});
-
-test('workspaceCode generates unique slugs', () => {
-  assert.equal(workspaceCode('Dhaka Main Shop'), 'DHAKA-MAIN-SHOP');
-  assert.equal(workspaceCode('Dhaka Main Shop', ['DHAKA-MAIN-SHOP']), 'DHAKA-MAIN-SHOP-2');
-  assert.equal(workspaceCode('!!!'), 'WS');
 });
 
 test('validators', () => {

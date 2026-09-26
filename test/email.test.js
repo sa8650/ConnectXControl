@@ -1,5 +1,5 @@
 /* Email-gateway tests: owner email settings (Brevo & co.), the client
-   send endpoint (POST client/v1/email/send) with MOCK_EMAIL, key masking,
+   send endpoint (POST client/v1/email/send) with MOCK_EMAIL + shop scoping, key masking,
    limits, and the EMS-style camelCase aliases + duplicate guard for SMS. */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -15,7 +15,7 @@ const control = async (path, opts = {}) =>
 const client = async (path, opts = {}) =>
   readJson(await clientRoutes(makeCtx(env, makeRequest('/api/' + path, opts))));
 
-let ownerToken = '', apiKey = '', workspaceId = '';
+let ownerToken = '', apiKey = '';
 
 test('bootstrap owner', async () => {
   const res = await control('control/setup', {
@@ -24,8 +24,6 @@ test('bootstrap owner', async () => {
   });
   assert.ok(res.token);
   ownerToken = res.token;
-  const ws = await control('control/workspaces', { token: ownerToken });
-  workspaceId = ws[0].id;
 });
 
 test('email settings: defaults, owner-only, test blocked before config', async () => {
@@ -85,11 +83,11 @@ test('test send works through the mock provider', async () => {
 });
 
 test('client key: send email via ConnectX (validation → success → history)', async () => {
-  const clients = await control('control/clients', { token: ownerToken });
-  const ems = clients.find(c => c.client_key === 'ems');
-  const keyRes = await control(`control/clients/${ems.id}/keys`, {
+  const systems = await control('control/systems', { token: ownerToken });
+  const ems = systems.find(c => c.system_key === 'ems');
+  const keyRes = await control(`control/systems/${ems.id}/keys`, {
     method: 'POST', token: ownerToken,
-    body: { label: 'EMS prod', workspace_id: workspaceId, daily_limit: 50 }
+    body: { label: 'EMS prod', daily_limit: 50 }
   });
   apiKey = keyRes.api_key;
 
@@ -103,6 +101,7 @@ test('client key: send email via ConnectX (validation → success → history)',
   const sent = await client('client/v1/email/send', {
     method: 'POST', apiKey,
     body: {
+      shop: 'store-1',
       to: 'customer@shop.test', cc: ['accounts@shop.test'], subject: 'Invoice INV-9 from Main',
       body: 'Dear customer,\nThanks for your purchase.',
       recipient_name: 'Rahim', reference_number: 'INV-9', idempotency_key: 'EMAIL:INV-9'
@@ -124,13 +123,13 @@ test('client key: send email via ConnectX (validation → success → history)',
   // idempotent retry returns the original job without resending
   const dup = await client('client/v1/email/send', {
     method: 'POST', apiKey,
-    body: { to: 'customer@shop.test', subject: 'Invoice INV-9 from Main', body: 'x', idempotency_key: 'EMAIL:INV-9' }
+    body: { shop: 'store-1', to: 'customer@shop.test', subject: 'Invoice INV-9 from Main', body: 'x', idempotency_key: 'EMAIL:INV-9' }
   });
   assert.equal(dup.duplicate, true);
   assert.equal(dup.id, sent.id);
 
   // visible through the email history listing
-  const list = await client('client/v1/email', { apiKey });
+  const list = await client('client/v1/email?shop=store-1', { apiKey });
   assert.ok(list.items.some(e => e.id === sent.id));
 });
 
@@ -138,9 +137,10 @@ test('html emails, camelCase aliases and per-message sender name', async () => {
   const sent = await client('client/v1/email/send', {
     method: 'POST', apiKey,
     body: {
+      shop: 'store-1',
       to: 'buyer@shop.test', subject: 'HTML mail',
       html: '<p>Hello <b>world</b></p>',
-      fromName: 'Main Workspace', replyTo: 'sales@shop.test', referenceNumber: 'INV-10'
+      fromName: 'Main Shop', replyTo: 'sales@shop.test', referenceNumber: 'INV-10'
     }
   });
   assert.equal(sent.status, 'sent');
@@ -151,13 +151,13 @@ test('html emails, camelCase aliases and per-message sender name', async () => {
 test('global daily email limit + disabled switch', async () => {
   await control('control/email', { method: 'PATCH', token: ownerToken, body: { daily_limit: 2 } });
   const blocked = await client('client/v1/email/send', {
-    method: 'POST', apiKey, body: { to: 'x@y.test', subject: 'over limit', body: 'x' }
+    method: 'POST', apiKey, body: { shop: 'store-1', to: 'x@y.test', subject: 'over limit', body: 'x' }
   });
   assert.match(blocked.error, /daily email limit/i);
 
   await control('control/email', { method: 'PATCH', token: ownerToken, body: { daily_limit: 0, enabled: false } });
   const off = await client('client/v1/email/send', {
-    method: 'POST', apiKey, body: { to: 'x@y.test', subject: 'while disabled', body: 'x' }
+    method: 'POST', apiKey, body: { shop: 'store-1', to: 'x@y.test', subject: 'while disabled', body: 'x' }
   });
   assert.match(off.error, /disabled/i);
   await control('control/email', { method: 'PATCH', token: ownerToken, body: { enabled: true } });
@@ -166,7 +166,7 @@ test('global daily email limit + disabled switch', async () => {
 test('EMS-style SMS aliases: /sms/send path + camelCase fields + response shape', async () => {
   const sent = await client('client/v1/sms/send', {
     method: 'POST', apiKey,
-    body: { toPhone: '+8801711112222', messageBody: 'Thanks for your purchase!', recipientName: 'Karim', messageType: 'SALE', invoiceNumber: 'INV-77', idempotencyKey: 'SALE:INV-77' }
+    body: { storeId: 'store-1', toPhone: '+8801711112222', messageBody: 'Thanks for your purchase!', recipientName: 'Karim', messageType: 'SALE', invoiceNumber: 'INV-77', idempotencyKey: 'SALE:INV-77' }
   });
   assert.equal(sent.ok, true);
   assert.equal(sent.status, 'queued');
@@ -179,7 +179,7 @@ test('EMS-style SMS aliases: /sms/send path + camelCase fields + response shape'
 
   const dup = await client('client/v1/sms/send', {
     method: 'POST', apiKey,
-    body: { toPhone: '+8801711112222', messageBody: 'Thanks for your purchase!', idempotencyKey: 'SALE:INV-77' }
+    body: { storeId: 'store-1', toPhone: '+8801711112222', messageBody: 'Thanks for your purchase!', idempotencyKey: 'SALE:INV-77' }
   });
   assert.equal(dup.duplicate, true);
 });
@@ -187,7 +187,7 @@ test('EMS-style SMS aliases: /sms/send path + camelCase fields + response shape'
 test('5-second duplicate guard blocks an accidental immediate resend', async () => {
   const again = await client('client/v1/sms', {
     method: 'POST', apiKey,
-    body: { to: '+8801711112222', message: 'Different body, same phone, instantly' }
+    body: { shop: 'store-1', to: '+8801711112222', message: 'Different body, same phone, instantly' }
   });
   assert.match(again.error, /Duplicate SMS detected/);
 
@@ -195,7 +195,7 @@ test('5-second duplicate guard blocks an accidental immediate resend', async () 
   sqlite.prepare("UPDATE cx_jobs SET created_at = '2020-01-01T00:00:00.000Z' WHERE to_phone = '+8801711112222'").run();
   const later = await client('client/v1/sms', {
     method: 'POST', apiKey,
-    body: { to: '+8801711112222', message: 'Later resend is fine' }
+    body: { shop: 'store-1', to: '+8801711112222', message: 'Later resend is fine' }
   });
   assert.equal(later.ok, true);
 });

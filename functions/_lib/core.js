@@ -117,14 +117,6 @@ export const str = (v, max = 500) => String(v ?? '').trim().slice(0, max);
 export const bool = v => v === true || v === 1 || v === '1' || v === 'true';
 export const nowIso = () => new Date().toISOString();
 
-/** Workspace short code from a name: "Dhaka Main Shop" -> "DHAKA-MAIN" style. */
-export function workspaceCode(name, existing = []) {
-  const base = String(name || '').toUpperCase().replace(/[^A-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 24) || 'WS';
-  let code = base, n = 2;
-  while (existing.includes(code)) code = `${base}-${n++}`;
-  return code;
-}
-
 /* ---------- time helpers ---------- */
 /** A device is "online" when it checked in within the last 3 minutes. */
 export const onlineOf = lastSeen =>
@@ -155,10 +147,10 @@ export function fillTemplate(tpl, vars) {
   return String(tpl || '').replace(/\{(name|shop|invoice|total|paid|due|amount|currency)\}/g, (_, k) => vars[k] ?? '');
 }
 const money = v => Number(v || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-export function templateVars(workspaceName, v = {}) {
+export function templateVars(shopName, v = {}) {
   return {
     name: v.name || 'Customer',
-    shop: workspaceName || 'Shop',
+    shop: shopName || 'Shop',
     invoice: v.invoice || v.reference || '',
     total: money(v.total), paid: money(v.paid), due: money(v.due), amount: money(v.amount ?? v.paid),
     currency: v.currency || 'BDT'

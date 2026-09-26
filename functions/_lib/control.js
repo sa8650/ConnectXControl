@@ -1,26 +1,27 @@
 /* =====================================================================
    ConnectX Control API — backend for the control website.
-   Operator/owner sessions (HMAC bearer tokens) manage workspaces,
-   gateway devices, message jobs, client products + API keys, releases,
-   SIM carrier catalog, platform settings and the audit trail.
+   Operator/owner sessions (HMAC bearer tokens) manage SYSTEM integrations
+   (EMS, InfluenceOS, CareOS, PlugX...), shops synced from those systems,
+   gateway devices, message jobs, API keys, releases, SIM carrier catalog,
+   the email gateway, platform settings and the audit trail.
    ===================================================================== */
 import { all, get, insert, update, run, parseJson } from './db.js';
 import {
   json, fail, uuid, nowIso, str, bool, cleanPhone, isEmail, isUuid, isVersion, isPackage,
   dayStart, onlineOf, signToken, verifyToken, bearerOf, hashPassword, checkPassword,
-  sha256, clientApiKey, pairingCode, workspaceCode, DEFAULT_TEMPLATES
+  sha256, clientApiKey, pairingCode, DEFAULT_TEMPLATES
 } from './core.js';
 import { logActivity, recentActivity } from './audit.js';
-import { publicOperator, publicWorkspace, publicDevice, smsJobRow } from './device.js';
+import { publicOperator, publicShop, publicSystem, publicDevice, smsJobRow } from './device.js';
 import { apkKey, getReleaseBucket, releaseStatus, downloadPath } from './releases.js';
 import { emailConfig, providerList, sendEmail } from './email.js';
 
 const CONTROL_TTL = 60 * 60 * 12; // 12h control-panel sessions
-const SEED_CLIENTS = [
-  { key: 'ems', name: 'EMS', description: 'Enterprise Management Software (legacy owner product).' },
-  { key: 'careos', name: 'CareOS', description: 'CareOS platform integration.' },
-  { key: 'influenceos', name: 'InfluenceOS', description: 'InfluenceOS platform integration.' },
-  { key: 'plugx', name: 'PlugX', description: 'PlugX platform integration.' }
+const SEED_SYSTEMS = [
+  { key: 'ems', name: 'EMS', description: 'Enterprise Management Software — administrators sign in with their EMS account.' },
+  { key: 'influenceos', name: 'InfluenceOS', description: 'InfluenceOS platform integration (connect its API URL when ready).' },
+  { key: 'careos', name: 'CareOS', description: 'CareOS platform integration (connect its API URL when ready).' },
+  { key: 'plugx', name: 'PlugX', description: 'PlugX platform integration (connect its API URL when ready).' }
 ];
 
 /* ---------- session ---------- */
@@ -38,6 +39,11 @@ async function auditOp(env, op, action, entityType, entityId, meta) {
     actorType: 'operator', actorId: op.id, actorLabel: `${op.name} (${op.role})`,
     action, entityType, entityId, meta
   });
+}
+
+function validHttpUrl(v) {
+  try { const u = new URL(String(v)); return u.protocol === 'https:' || u.protocol === 'http:'; }
+  catch { return false; }
 }
 
 /* ===================================================================== */
@@ -68,20 +74,14 @@ export async function controlRoutes(ctx) {
       password_hash: await hashPassword(password), role: 'owner', active: 1,
       created_at: nowIso(), updated_at: nowIso()
     });
-    // Seed the known product clients once.
-    for (const c of SEED_CLIENTS) {
-      const dup = await get(env, 'SELECT id FROM cx_clients WHERE client_key = ?', c.key);
-      if (!dup) await insert(env, 'cx_clients', {
-        id: uuid(), client_key: c.key, name: c.name, description: c.description,
+    // Seed the known systems once. Their API URLs are configured later on
+    // the Systems page — until then phones see them as "not connected yet".
+    for (const s of SEED_SYSTEMS) {
+      const dup = await get(env, 'SELECT id FROM cx_systems WHERE system_key = ?', s.key);
+      if (!dup) await insert(env, 'cx_systems', {
+        id: uuid(), system_key: s.key, name: s.name, description: s.description,
+        api_url: '', login_path: 'api/auth/admin/login', shops_path: 'api/connectx/gateway/shops',
         webhook_url: null, status: 'active', created_at: nowIso(), updated_at: nowIso()
-      });
-    }
-    // Seed a default workspace so a phone can pair immediately.
-    const wsCount = await get(env, 'SELECT COUNT(*) AS n FROM cx_workspaces');
-    if (!Number(wsCount?.n || 0)) {
-      await insert(env, 'cx_workspaces', {
-        id: uuid(), name: 'Main Workspace', code: 'MAIN', address: '', phone: '',
-        status: 'active', created_at: nowIso(), updated_at: nowIso()
       });
     }
     await logActivity(env, { actorType: 'system', action: 'platform initialized', entityType: 'operator', entityId: id });
@@ -133,27 +133,27 @@ export async function controlRoutes(ctx) {
   /* ---------------- dashboard ----------------------------------------- */
   if (path === 'control/dashboard' && method === 'GET') {
     const today = dayStart(url.searchParams.get('utcOffsetMinutes')) || new Date().toISOString().slice(0, 10) + 'T00:00:00Z';
-    const [jobs, devices, clients, workspaces, recent, byClientRows] = await Promise.all([
-      all(env, "SELECT id, channel, status, client_id, workspace_id, created_at FROM cx_jobs WHERE created_at >= ?", today),
-      all(env, "SELECT id, status, last_seen, workspace_id FROM cx_devices WHERE status != 'revoked'"),
-      all(env, "SELECT id, name, client_key, status FROM cx_clients"),
-      all(env, 'SELECT id, name, status FROM cx_workspaces'),
-      all(env, `SELECT j.*, c.name AS client_name, w.name AS workspace_name, w.code AS workspace_code
-                  FROM cx_jobs j LEFT JOIN cx_clients c ON c.id = j.client_id
-                  LEFT JOIN cx_workspaces w ON w.id = j.workspace_id
+    const [jobs, devices, systems, shops, recent, bySystemRows] = await Promise.all([
+      all(env, 'SELECT id, channel, status, system_id, shop_id, created_at FROM cx_jobs WHERE created_at >= ?', today),
+      all(env, "SELECT id, status, last_seen, shop_id FROM cx_devices WHERE status != 'revoked'"),
+      all(env, 'SELECT id, name, system_key, status, api_url FROM cx_systems'),
+      all(env, 'SELECT id, name, status FROM cx_shops'),
+      all(env, `SELECT j.*, s.name AS system_name, sh.name AS shop_name, sh.external_id AS shop_external_id
+                  FROM cx_jobs j LEFT JOIN cx_systems s ON s.id = j.system_id
+                  LEFT JOIN cx_shops sh ON sh.id = j.shop_id
                  ORDER BY j.created_at DESC LIMIT 12`),
-      all(env, "SELECT client_id, status, COUNT(*) AS n FROM cx_jobs WHERE created_at >= ? GROUP BY client_id, status", today)
+      all(env, 'SELECT system_id, status, COUNT(*) AS n FROM cx_jobs WHERE created_at >= ? GROUP BY system_id, status', today)
     ]);
     const count = (ch, sts) => jobs.filter(j => j.channel === ch && sts.includes(j.status)).length;
-    const clientMap = Object.fromEntries(clients.map(c => [c.id, c]));
-    const byClient = {};
-    for (const r of byClientRows) {
-      const c = clientMap[r.client_id] || { name: 'Console / Device', client_key: null };
-      const keyName = c.name || 'Unknown';
-      byClient[keyName] ||= { sent: 0, failed: 0, pending: 0 };
-      if (r.status === 'sent') byClient[keyName].sent += r.n;
-      else if (r.status === 'failed') byClient[keyName].failed += r.n;
-      else if (['queued', 'sending'].includes(r.status)) byClient[keyName].pending += r.n;
+    const systemMap = Object.fromEntries(systems.map(s => [s.id, s]));
+    const bySystem = {};
+    for (const r of bySystemRows) {
+      const s = systemMap[r.system_id] || { name: 'Console / Device', system_key: null };
+      const keyName = s.name || 'Unknown';
+      bySystem[keyName] ||= { sent: 0, failed: 0, pending: 0 };
+      if (r.status === 'sent') bySystem[keyName].sent += r.n;
+      else if (r.status === 'failed') bySystem[keyName].failed += r.n;
+      else if (['queued', 'sending'].includes(r.status)) bySystem[keyName].pending += r.n;
     }
     return json({
       today: {
@@ -167,99 +167,250 @@ export async function controlRoutes(ctx) {
         online: devices.filter(d => onlineOf(d.last_seen) && d.status === 'active').length,
         pendingTest: devices.filter(d => d.status === 'pending_test').length
       },
-      workspaces: { total: workspaces.length, active: workspaces.filter(w => w.status === 'active').length },
-      clients: { total: clients.length, active: clients.filter(c => c.status === 'active').length },
-      byClient,
+      shops: { total: shops.length, active: shops.filter(w => w.status === 'active').length },
+      systems: {
+        total: systems.length,
+        active: systems.filter(s => s.status === 'active').length,
+        connected: systems.filter(s => s.status === 'active' && s.api_url).length
+      },
+      bySystem,
       recentJobs: recent.map(j => ({
         id: j.id, channel: j.channel, status: j.status,
         to: j.channel === 'sms' ? j.to_phone : (parseJson(j.to_emails, []) || []).join(', '),
         recipient_name: j.recipient_name, message_type: j.message_type,
-        client_name: j.client_name || 'Console', workspace_name: j.workspace_name, workspace_code: j.workspace_code,
+        system_name: j.system_name || 'Console', shop_name: j.shop_name, shop_external_id: j.shop_external_id,
         created_at: j.created_at, sent_at: j.sent_at
       }))
     });
   }
 
-  /* ---------------- workspaces ---------------------------------------- */
-  if (path === 'control/workspaces' && method === 'GET') {
-    const rows = await all(env, 'SELECT * FROM cx_workspaces ORDER BY created_at DESC');
-    const deviceCounts = await all(env, "SELECT workspace_id, COUNT(*) AS n FROM cx_devices WHERE status != 'revoked' GROUP BY workspace_id");
-    const dMap = Object.fromEntries(deviceCounts.map(r => [r.workspace_id, r.n]));
-    const devices = await all(env, "SELECT workspace_id, last_seen, status FROM cx_devices WHERE status != 'revoked'");
-    const onlineMap = {};
-    for (const d of devices) if (onlineOf(d.last_seen)) onlineMap[d.workspace_id] = (onlineMap[d.workspace_id] || 0) + 1;
-    return json(rows.map(w => ({
-      ...publicWorkspace(w), status: w.status, created_at: w.created_at, updated_at: w.updated_at,
-      devices: dMap[w.id] || 0, online: onlineMap[w.id] || 0
+  /* ---------------- systems (integrations) ----------------------------- */
+  if (path === 'control/systems' && method === 'GET') {
+    const rows = await all(env, 'SELECT * FROM cx_systems ORDER BY created_at ASC');
+    const keyRows = await all(env, 'SELECT id, system_id, label, key_prefix, daily_limit, status, last_used_at, created_at FROM cx_api_keys ORDER BY created_at DESC');
+    const usage = await all(env, `SELECT system_id, status, COUNT(*) AS n FROM cx_jobs
+      WHERE created_at >= ? GROUP BY system_id, status`, new Date(Date.now() - 30 * 86400000).toISOString());
+    const shopCounts = await all(env, 'SELECT system_id, COUNT(*) AS n FROM cx_shops GROUP BY system_id');
+    const deviceCounts = await all(env,
+      "SELECT sh.system_id, COUNT(*) AS n FROM cx_devices d JOIN cx_shops sh ON sh.id = d.shop_id WHERE d.status != 'revoked' GROUP BY sh.system_id");
+    const usageMap = {}, shopMap = {}, devMap = {};
+    for (const u of usage) {
+      usageMap[u.system_id] ||= { sent: 0, failed: 0, pending: 0, cancelled: 0 };
+      if (u.status === 'sent') usageMap[u.system_id].sent += u.n;
+      else if (u.status === 'failed') usageMap[u.system_id].failed += u.n;
+      else if (u.status === 'cancelled') usageMap[u.system_id].cancelled += u.n;
+      else usageMap[u.system_id].pending += u.n;
+    }
+    for (const s of shopCounts) shopMap[s.system_id] = s.n;
+    for (const d of deviceCounts) devMap[d.system_id] = d.n;
+    return json(rows.map(s => ({
+      id: s.id, system_key: s.system_key, name: s.name, description: s.description,
+      api_url: s.api_url, login_path: s.login_path, shops_path: s.shops_path,
+      webhook_url: s.webhook_url, status: s.status,
+      configured: !!s.api_url,
+      shops: shopMap[s.id] || 0, devices: devMap[s.id] || 0,
+      created_at: s.created_at,
+      usage30d: usageMap[s.id] || { sent: 0, failed: 0, pending: 0, cancelled: 0 },
+      keys: keyRows.filter(k => k.system_id === s.id)
     })));
   }
-  if (path === 'control/workspaces' && method === 'POST') {
+  if (path === 'control/systems' && method === 'POST') {
+    if (!ownerOnly(op)) return fail('Only the owner can add system integrations.', 403);
     const b = await body();
-    const name = str(b.name || '', 160);
-    if (!name) return fail('Workspace name is required.', 400);
-    const existing = (await all(env, 'SELECT code FROM cx_workspaces')).map(w => w.code);
-    const code = str(b.code || '', 24).toUpperCase().replace(/[^A-Z0-9-]/g, '') || workspaceCode(name, existing);
-    if (existing.includes(code)) return fail(`Workspace code "${code}" already exists.`, 409);
+    const name = str(b.name || '', 120);
+    const key = str(b.system_key || b.client_key || name.toLowerCase().replace(/[^a-z0-9]+/g, ''), 40).replace(/[^a-z0-9_]/g, '');
+    if (!name || !/^[a-z0-9_]{2,40}$/.test(key)) return fail('Name and a slug system_key (a-z, 0-9, _) are required.', 400);
+    const dup = await get(env, 'SELECT id FROM cx_systems WHERE system_key = ?', key);
+    if (dup) return fail('That system_key already exists.', 409);
+    if (b.api_url && !validHttpUrl(b.api_url)) return fail('API URL must be a valid http(s) URL.', 400);
     const id = uuid();
-    await insert(env, 'cx_workspaces', {
-      id, name, code, address: str(b.address || '', 240), phone: str(b.phone || '', 32),
-      status: 'active', created_at: nowIso(), updated_at: nowIso()
+    await insert(env, 'cx_systems', {
+      id, system_key: key, name, description: str(b.description || '', 500),
+      api_url: str(b.api_url || '', 500).replace(/\/+$/, ''),
+      login_path: str(b.login_path || 'api/auth/admin/login', 200),
+      shops_path: str(b.shops_path || 'api/connectx/gateway/shops', 200),
+      webhook_url: null, status: 'active', created_at: nowIso(), updated_at: nowIso()
     });
-    await auditOp(env, op, 'create workspace', 'workspace', id, { name, code });
-    return json({ ok: true, workspace: publicWorkspace(await get(env, 'SELECT * FROM cx_workspaces WHERE id = ?', id)) }, 201);
+    await auditOp(env, op, 'add system integration', 'system', id, { name, system_key: key });
+    return json({ ok: true, system: await get(env, 'SELECT * FROM cx_systems WHERE id = ?', id) }, 201);
   }
-  if (path.match(/^control\/workspaces\/[^/]+$/) && ['PATCH', 'DELETE'].includes(method)) {
+  if (path.match(/^control\/systems\/[^/]+$/) && ['PATCH', 'DELETE'].includes(method)) {
+    if (!ownerOnly(op)) return fail('Only the owner can manage system integrations.', 403);
     const id = decodeURIComponent(path.split('/')[2]);
-    const ws = await get(env, 'SELECT * FROM cx_workspaces WHERE id = ?', id);
-    if (!ws) return fail('Workspace not found.', 404);
+    const system = await get(env, 'SELECT * FROM cx_systems WHERE id = ?', id);
+    if (!system) return fail('System not found.', 404);
     if (method === 'DELETE') {
-      if (!ownerOnly(op)) return fail('Only the owner can delete a workspace.', 403);
-      const jobs = await get(env, 'SELECT COUNT(*) AS n FROM cx_jobs WHERE workspace_id = ?', id);
-      if (Number(jobs?.n || 0) > 0) return fail('Delete or keep for audit: workspace has message history. Pause it instead.', 409);
-      await update(env, 'cx_devices', { status: 'revoked', token_hash: null }, 'workspace_id = ?', id);
-      await update(env, 'cx_workspaces', { status: 'paused', updated_at: nowIso() }, 'id = ?', id);
-      await auditOp(env, op, 'pause + purge workspace', 'workspace', id, { name: ws.name });
-      return json({ ok: true, paused: true });
+      const jobs = await get(env, 'SELECT COUNT(*) AS n FROM cx_jobs WHERE system_id = ?', id);
+      if (Number(jobs?.n || 0) > 0)
+        return fail('This system has message history. Disable it instead of deleting (history is kept for audit).', 409);
+      const devices = await get(env,
+        'SELECT COUNT(*) AS n FROM cx_devices d JOIN cx_shops sh ON sh.id = d.shop_id WHERE sh.system_id = ?', id);
+      if (Number(devices?.n || 0) > 0)
+        return fail('Gateway devices are still paired to shops of this system. Revoke them first.', 409);
+      await run(env, 'DELETE FROM cx_api_keys WHERE system_id = ?', id);
+      await run(env, 'DELETE FROM cx_shops WHERE system_id = ?', id);
+      await run(env, 'DELETE FROM cx_admins WHERE system_id = ?', id);
+      await run(env, 'DELETE FROM cx_systems WHERE id = ?', id);
+      await auditOp(env, op, 'delete system integration', 'system', id, { name: system.name });
+      return json({ ok: true, deleted: true });
     }
     const b = await body();
     const patch = { updated_at: nowIso() };
-    if (b.name !== undefined) patch.name = str(b.name, 160) || ws.name;
-    if (b.address !== undefined) patch.address = str(b.address, 240);
-    if (b.phone !== undefined) patch.phone = str(b.phone, 32);
+    if (b.name !== undefined) patch.name = str(b.name, 120) || system.name;
+    if (b.description !== undefined) patch.description = str(b.description, 500);
+    if (b.status !== undefined && ['active', 'disabled'].includes(b.status)) patch.status = b.status;
+    if (b.api_url !== undefined) {
+      const au = str(b.api_url, 500).trim().replace(/\/+$/, '');
+      if (au && !validHttpUrl(au)) return fail('API URL must be a valid http(s) URL.', 400);
+      patch.api_url = au;
+    }
+    if (b.login_path !== undefined) patch.login_path = str(b.login_path, 200).replace(/^\/+/, '') || system.login_path;
+    if (b.shops_path !== undefined) patch.shops_path = str(b.shops_path, 200).replace(/^\/+/, '') || system.shops_path;
+    if (b.webhook_url !== undefined) {
+      const wu = str(b.webhook_url, 500);
+      if (wu && !/^https:\/\//.test(wu)) return fail('Webhook URL must be https:// or empty.', 400);
+      patch.webhook_url = wu || null;
+    }
+    await update(env, 'cx_systems', patch, 'id = ?', id);
+    await auditOp(env, op, 'update system integration', 'system', id, { fields: Object.keys(b) });
+    return json({ ok: true, system: await get(env, 'SELECT * FROM cx_systems WHERE id = ?', id) });
+  }
+
+  /* ---------------- API keys (owner) ----------------------------------- */
+  if (path.match(/^control\/systems\/[^/]+\/keys$/) && method === 'POST') {
+    if (!ownerOnly(op)) return fail('Only the owner can issue API keys.', 403);
+    const id = decodeURIComponent(path.split('/')[2]);
+    const system = await get(env, 'SELECT * FROM cx_systems WHERE id = ?', id);
+    if (!system) return fail('System not found.', 404);
+    const b = await body();
+    const plain = clientApiKey();
+    const row = {
+      id: uuid(), system_id: system.id,
+      label: str(b.label || 'Default key', 120),
+      key_prefix: plain.slice(0, 16),
+      key_hash: await sha256(plain),
+      daily_limit: Math.max(0, Number(b.daily_limit ?? Number(env.DEFAULT_DAILY_LIMIT || 1000))),
+      status: 'active', last_used_at: null, created_at: nowIso(), revoked_at: null
+    };
+    await insert(env, 'cx_api_keys', row);
+    await auditOp(env, op, 'issue API key', 'system', system.id, { label: row.label, prefix: row.key_prefix });
+    // The plain key is returned exactly once.
+    return json({ ok: true, api_key: plain, key: { ...row, key_hash: undefined } }, 201);
+  }
+  if (path.match(/^control\/keys\/[^/]+\/revoke$/) && method === 'POST') {
+    if (!ownerOnly(op)) return fail('Only the owner can revoke API keys.', 403);
+    const id = decodeURIComponent(path.split('/')[2]);
+    const k = await get(env, 'SELECT * FROM cx_api_keys WHERE id = ?', id);
+    if (!k) return fail('API key not found.', 404);
+    await update(env, 'cx_api_keys', { status: 'revoked', revoked_at: nowIso() }, 'id = ?', id);
+    await auditOp(env, op, 'revoke API key', 'system', k.system_id, { prefix: k.key_prefix });
+    return json({ ok: true });
+  }
+
+  /* ---------------- shops ---------------------------------------------- */
+  if (path === 'control/shops' && method === 'GET') {
+    const q = url.searchParams;
+    const conds = [], binds = [];
+    if (q.get('system_id')) { conds.push('sh.system_id = ?'); binds.push(q.get('system_id')); }
+    if (q.get('status') && ['active', 'paused'].includes(q.get('status'))) { conds.push('sh.status = ?'); binds.push(q.get('status')); }
+    if (q.get('search')) {
+      conds.push('(sh.name LIKE ? OR sh.external_id LIKE ? OR sh.shop_code LIKE ?)');
+      const s = `%${str(q.get('search'), 80)}%`; binds.push(s, s, s);
+    }
+    const where = conds.length ? 'WHERE ' + conds.join(' AND ') : '';
+    const rows = await all(env,
+      `SELECT sh.*, s.name AS system_name, s.system_key
+         FROM cx_shops sh LEFT JOIN cx_systems s ON s.id = sh.system_id
+         ${where} ORDER BY sh.name ASC LIMIT 300`, ...binds);
+    const deviceCounts = await all(env, "SELECT shop_id, COUNT(*) AS n FROM cx_devices WHERE status != 'revoked' GROUP BY shop_id");
+    const dMap = Object.fromEntries(deviceCounts.map(r => [r.shop_id, r.n]));
+    const devices = await all(env, "SELECT shop_id, last_seen, status FROM cx_devices WHERE status != 'revoked'");
+    const onlineMap = {};
+    for (const d of devices) if (onlineOf(d.last_seen)) onlineMap[d.shop_id] = (onlineMap[d.shop_id] || 0) + 1;
+    return json(rows.map(sh => ({
+      ...publicShop(sh),
+      system_id: sh.system_id, system_name: sh.system_name, system_key: sh.system_key,
+      devices: dMap[sh.id] || 0, online: onlineMap[sh.id] || 0,
+      created_at: sh.created_at, updated_at: sh.updated_at
+    })));
+  }
+  if (path === 'control/shops' && method === 'POST') {
+    // Manual provisioning (e.g. so a pairing code can be created before the
+    // administrator's first sign-in syncs the shop automatically).
+    const b = await body();
+    const system = await get(env, 'SELECT * FROM cx_systems WHERE id = ?', str(b.system_id || ''));
+    if (!system) return fail('Choose a system for this shop.', 404);
+    const externalId = str(b.external_id || b.shop_id || '', 80);
+    const name = str(b.name || '', 160);
+    if (!externalId || !name) return fail('The shop id inside the system and a name are required.', 400);
+    const dup = await get(env, 'SELECT id FROM cx_shops WHERE system_id = ? AND external_id = ?', system.id, externalId);
+    if (dup) return fail('That shop is already registered.', 409);
+    const id = uuid();
+    await insert(env, 'cx_shops', {
+      id, system_id: system.id, external_id: externalId, name,
+      shop_code: str(b.shop_code || '', 60), address: str(b.address || '', 240),
+      phone: str(b.phone || '', 32), category: str(b.category || '', 80),
+      system_status: 'active', status: 'active', created_at: nowIso(), updated_at: nowIso()
+    });
+    await auditOp(env, op, 'register shop', 'shop', id, { name, system: system.system_key, external_id: externalId });
+    return json({ ok: true, shop: publicShop(await get(env, 'SELECT * FROM cx_shops WHERE id = ?', id)) }, 201);
+  }
+  if (path.match(/^control\/shops\/[^/]+$/) && ['PATCH', 'DELETE'].includes(method)) {
+    const id = decodeURIComponent(path.split('/')[2]);
+    const shop = await get(env, 'SELECT * FROM cx_shops WHERE id = ?', id);
+    if (!shop) return fail('Shop not found.', 404);
+    if (method === 'DELETE') {
+      if (!ownerOnly(op)) return fail('Only the owner can delete a shop.', 403);
+      const jobs = await get(env, 'SELECT COUNT(*) AS n FROM cx_jobs WHERE shop_id = ?', id);
+      const devices = await get(env, "SELECT COUNT(*) AS n FROM cx_devices WHERE shop_id = ? AND status != 'revoked'", id);
+      if (Number(jobs?.n || 0) > 0 || Number(devices?.n || 0) > 0)
+        return fail('This shop has devices or message history. Pause it instead of deleting.', 409);
+      await run(env, 'DELETE FROM cx_shops WHERE id = ?', id);
+      await auditOp(env, op, 'delete shop', 'shop', id, { name: shop.name });
+      return json({ ok: true, deleted: true });
+    }
+    const b = await body();
+    const patch = { updated_at: nowIso() };
+    if (b.name !== undefined) patch.name = str(b.name, 160) || shop.name;
+    if (b.shop_code !== undefined) patch.shop_code = str(b.shop_code, 60);
     if (b.status !== undefined && ['active', 'paused'].includes(b.status)) patch.status = b.status;
-    await update(env, 'cx_workspaces', patch, 'id = ?', id);
-    await auditOp(env, op, 'update workspace', 'workspace', id, { fields: Object.keys(b) });
-    return json({ ok: true, workspace: publicWorkspace(await get(env, 'SELECT * FROM cx_workspaces WHERE id = ?', id)) });
+    await update(env, 'cx_shops', patch, 'id = ?', id);
+    await auditOp(env, op, 'update shop', 'shop', id, { fields: Object.keys(b) });
+    return json({ ok: true, shop: publicShop(await get(env, 'SELECT * FROM cx_shops WHERE id = ?', id)) });
   }
 
   /* ---------------- devices ------------------------------------------- */
   if (path === 'control/devices' && method === 'GET') {
-    const wsFilter = url.searchParams.get('workspace_id');
+    const shopFilter = url.searchParams.get('shop_id');
     const rows = await all(env,
-      `SELECT d.*, w.name AS workspace_name, w.code AS workspace_code
-         FROM cx_devices d LEFT JOIN cx_workspaces w ON w.id = d.workspace_id
-        ${wsFilter ? 'WHERE d.workspace_id = ?' : ''}
-        ORDER BY d.last_seen DESC, d.created_at DESC LIMIT 200`, ...(wsFilter ? [wsFilter] : []));
+      `SELECT d.*, sh.name AS shop_name, sh.external_id AS shop_external_id, s.name AS system_name, s.system_key
+         FROM cx_devices d LEFT JOIN cx_shops sh ON sh.id = d.shop_id
+         LEFT JOIN cx_systems s ON s.id = sh.system_id
+        ${shopFilter ? 'WHERE d.shop_id = ?' : ''}
+        ORDER BY d.last_seen DESC, d.created_at DESC LIMIT 200`, ...(shopFilter ? [shopFilter] : []));
     return json(rows.map(d => ({
       ...publicDevice(d),
-      workspace_name: d.workspace_name, workspace_code: d.workspace_code,
+      shop_name: d.shop_name, shop_external_id: d.shop_external_id,
+      system_name: d.system_name, system_key: d.system_key,
       online: onlineOf(d.last_seen) && d.status !== 'revoked'
     })));
   }
   if (path === 'control/devices/pairing-code' && method === 'POST') {
     const b = await body();
-    const wsId = str(b.workspace_id || '', 64);
-    const ws = await get(env, "SELECT * FROM cx_workspaces WHERE id = ? AND status = 'active'", wsId);
-    if (!ws) return fail('Choose an active workspace for this pairing code.', 404);
+    const shopId = str(b.shop_id || '', 64);
+    const shop = await get(env, "SELECT * FROM cx_shops WHERE id = ? AND status = 'active'", shopId);
+    if (!shop) return fail('Choose an active shop for this pairing code.', 404);
+    const system = await get(env, "SELECT * FROM cx_systems WHERE id = ? AND status = 'active'", shop.system_id);
+    if (!system) return fail('The system for this shop is not active.', 404);
     const ttl = Math.min(1440, Math.max(5, Number(b.ttl_minutes || 60)));
     const code = pairingCode();
     const id = uuid();
     await insert(env, 'cx_pairing_codes', {
-      id, code, workspace_id: ws.id, created_by: op.id, device_id: null,
+      id, code, shop_id: shop.id, created_by: op.id, device_id: null,
       expires_at: new Date(Date.now() + ttl * 60000).toISOString(), used_at: null, created_at: nowIso()
     });
-    await auditOp(env, op, 'create pairing code', 'workspace', ws.id, { ttl_minutes: ttl });
-    return json({ ok: true, code, workspace: publicWorkspace(ws), expires_in_minutes: ttl }, 201);
+    await auditOp(env, op, 'create pairing code', 'shop', shop.id, { ttl_minutes: ttl });
+    return json({ ok: true, code, shop: publicShop(shop), system: publicSystem(system), expires_in_minutes: ttl }, 201);
   }
   if (path.match(/^control\/devices\/[^/]+\/(revoke|restore|primary|rename)$/) && method === 'POST') {
     const [, , id, action] = path.split('/');
@@ -277,7 +428,7 @@ export async function controlRoutes(ctx) {
       return json({ ok: true, note: 'The phone must re-run its connection test to become active.' });
     }
     if (action === 'primary') {
-      await update(env, 'cx_devices', { is_primary: 0 }, 'workspace_id = ?', device.workspace_id);
+      await update(env, 'cx_devices', { is_primary: 0 }, 'shop_id = ?', device.shop_id);
       await update(env, 'cx_devices', { is_primary: 1, updated_at: nowIso() }, 'id = ?', device.id);
       await auditOp(env, op, 'set primary gateway', 'device', device.id);
       return json({ ok: true });
@@ -293,18 +444,18 @@ export async function controlRoutes(ctx) {
     const conds = [], binds = [];
     if (q.get('channel') && ['sms', 'email'].includes(q.get('channel'))) { conds.push('j.channel = ?'); binds.push(q.get('channel')); }
     if (q.get('status') && ['queued', 'sending', 'sent', 'failed', 'cancelled'].includes(q.get('status'))) { conds.push('j.status = ?'); binds.push(q.get('status')); }
-    if (q.get('workspace_id')) { conds.push('j.workspace_id = ?'); binds.push(q.get('workspace_id')); }
-    if (q.get('client_id')) { conds.push('j.client_id = ?'); binds.push(q.get('client_id')); }
+    if (q.get('shop_id')) { conds.push('j.shop_id = ?'); binds.push(q.get('shop_id')); }
+    if (q.get('system_id')) { conds.push('j.system_id = ?'); binds.push(q.get('system_id')); }
     if (q.get('search')) { conds.push('(j.to_phone LIKE ? OR j.recipient_name LIKE ? OR j.message_body LIKE ? OR j.subject LIKE ?)'); const s = `%${str(q.get('search'), 80)}%`; binds.push(s, s, s, s); }
     if (q.get('since')) { conds.push('j.created_at >= ?'); binds.push(q.get('since')); }
     const limit = Math.min(200, Math.max(1, Number(q.get('limit') || 50)));
     const offset = Math.max(0, Number(q.get('offset') || 0));
     const where = conds.length ? 'WHERE ' + conds.join(' AND ') : '';
     const rows = await all(env,
-      `SELECT j.*, c.name AS client_name, c.client_key, w.name AS workspace_name, w.code AS workspace_code, d.device_name
+      `SELECT j.*, s.name AS system_name, s.system_key, sh.name AS shop_name, sh.external_id AS shop_external_id, d.device_name
          FROM cx_jobs j
-         LEFT JOIN cx_clients c ON c.id = j.client_id
-         LEFT JOIN cx_workspaces w ON w.id = j.workspace_id
+         LEFT JOIN cx_systems s ON s.id = j.system_id
+         LEFT JOIN cx_shops sh ON sh.id = j.shop_id
          LEFT JOIN cx_devices d ON d.id = j.device_id
          ${where} ORDER BY j.created_at DESC LIMIT ? OFFSET ?`, ...binds, limit + 1, offset);
     const hasMore = rows.length > limit;
@@ -316,21 +467,21 @@ export async function controlRoutes(ctx) {
   if (path === 'control/jobs' && method === 'POST') {
     // Manual send from the console.
     const b = await body();
-    const ws = await get(env, "SELECT * FROM cx_workspaces WHERE id = ? AND status = 'active'", str(b.workspace_id || ''));
-    if (!ws) return fail('Choose an active workspace.', 404);
+    const shop = await get(env, "SELECT * FROM cx_shops WHERE id = ? AND status = 'active'", str(b.shop_id || ''));
+    if (!shop) return fail('Choose an active shop.', 404);
     const phone = cleanPhone(b.to || b.phone);
     const messageBody = str(b.message || '', 1600);
     if (!phone) return fail('A valid destination phone number is required.', 400);
     if (!messageBody) return fail('Message text is required.', 400);
     const row = smsJobRow({
-      workspaceId: ws.id, clientId: null, apiKeyId: null,
+      shopId: shop.id, systemId: null, apiKeyId: null,
       phone, name: b.recipient_name, recipientType: 'manual',
       messageType: b.message_type || 'Console Message', eventType: b.event_type || 'CONSOLE',
       referenceId: b.reference_id, referenceNumber: b.reference_number,
       messageBody, idempotencyKey: `CONSOLE:${uuid()}`
     });
     await insert(env, 'cx_jobs', row);
-    await auditOp(env, op, 'queue manual SMS', 'job', row.id, { to: phone, workspace: ws.code });
+    await auditOp(env, op, 'queue manual SMS', 'job', row.id, { to: phone, shop: shop.name });
     return json({ ok: true, job: jobView(row) }, 201);
   }
   if (path.match(/^control\/jobs\/[^/]+\/(cancel|retry)$/) && method === 'POST') {
@@ -356,101 +507,6 @@ export async function controlRoutes(ctx) {
       'id = ?', job.id);
     await auditOp(env, op, 'retry job', 'job', job.id);
     return json({ ok: true, retried: true });
-  }
-
-  /* ---------------- clients & API keys -------------------------------- */
-  if (path === 'control/clients' && method === 'GET') {
-    const rows = await all(env, 'SELECT * FROM cx_clients ORDER BY created_at ASC');
-    const keyRows = await all(env, "SELECT id, client_id, label, key_prefix, workspace_id, daily_limit, status, last_used_at, created_at FROM cx_api_keys ORDER BY created_at DESC");
-    const usage = await all(env, `SELECT client_id, status, COUNT(*) AS n FROM cx_jobs
-      WHERE created_at >= ? GROUP BY client_id, status`, new Date(Date.now() - 30 * 86400000).toISOString());
-    const workspaces = await all(env, 'SELECT id, name, code FROM cx_workspaces');
-    const wsMap = Object.fromEntries(workspaces.map(w => [w.id, w]));
-    const usageMap = {};
-    for (const u of usage) {
-      usageMap[u.client_id] ||= { sent: 0, failed: 0, pending: 0, cancelled: 0 };
-      if (u.status === 'sent') usageMap[u.client_id].sent += u.n;
-      else if (u.status === 'failed') usageMap[u.client_id].failed += u.n;
-      else if (u.status === 'cancelled') usageMap[u.client_id].cancelled += u.n;
-      else usageMap[u.client_id].pending += u.n;
-    }
-    return json(rows.map(c => ({
-      id: c.id, client_key: c.client_key, name: c.name, description: c.description,
-      webhook_url: c.webhook_url, status: c.status, created_at: c.created_at,
-      usage30d: usageMap[c.id] || { sent: 0, failed: 0, pending: 0, cancelled: 0 },
-      keys: keyRows.filter(k => k.client_id === c.id).map(k => ({
-        ...k, workspace: k.workspace_id ? wsMap[k.workspace_id] || null : null
-      }))
-    })));
-  }
-  if (path === 'control/clients' && method === 'POST') {
-    if (!ownerOnly(op)) return fail('Only the owner can add client products.', 403);
-    const b = await body();
-    const name = str(b.name || '', 120);
-    const key = str(b.client_key || name.toLowerCase().replace(/[^a-z0-9]+/g, ''), 40).replace(/[^a-z0-9_]/g, '');
-    if (!name || !/^[a-z0-9_]{2,40}$/.test(key)) return fail('Name and a slug client_key (a-z, 0-9, _) are required.', 400);
-    const dup = await get(env, 'SELECT id FROM cx_clients WHERE client_key = ?', key);
-    if (dup) return fail('That client_key already exists.', 409);
-    const id = uuid();
-    await insert(env, 'cx_clients', {
-      id, client_key: key, name, description: str(b.description || '', 500),
-      webhook_url: null, status: 'active', created_at: nowIso(), updated_at: nowIso()
-    });
-    await auditOp(env, op, 'add client product', 'client', id, { name, client_key: key });
-    return json({ ok: true, client: await get(env, 'SELECT * FROM cx_clients WHERE id = ?', id) }, 201);
-  }
-  if (path.match(/^control\/clients\/[^/]+$/) && method === 'PATCH') {
-    const id = decodeURIComponent(path.split('/')[2]);
-    const client = await get(env, 'SELECT * FROM cx_clients WHERE id = ?', id);
-    if (!client) return fail('Client not found.', 404);
-    const b = await body();
-    const patch = { updated_at: nowIso() };
-    if (b.name !== undefined) patch.name = str(b.name, 120) || client.name;
-    if (b.description !== undefined) patch.description = str(b.description, 500);
-    if (b.status !== undefined && ['active', 'disabled'].includes(b.status)) patch.status = b.status;
-    if (b.webhook_url !== undefined) {
-      const wu = str(b.webhook_url, 500);
-      if (wu && !/^https:\/\//.test(wu)) return fail('Webhook URL must be https:// or empty.', 400);
-      patch.webhook_url = wu || null;
-    }
-    await update(env, 'cx_clients', patch, 'id = ?', id);
-    await auditOp(env, op, 'update client product', 'client', id, { fields: Object.keys(b) });
-    return json({ ok: true, client: await get(env, 'SELECT * FROM cx_clients WHERE id = ?', id) });
-  }
-  if (path.match(/^control\/clients\/[^/]+\/keys$/) && method === 'POST') {
-    if (!ownerOnly(op)) return fail('Only the owner can issue API keys.', 403);
-    const id = decodeURIComponent(path.split('/')[2]);
-    const client = await get(env, 'SELECT * FROM cx_clients WHERE id = ?', id);
-    if (!client) return fail('Client not found.', 404);
-    const b = await body();
-    let wsId = null;
-    if (b.workspace_id) {
-      const ws = await get(env, 'SELECT id FROM cx_workspaces WHERE id = ?', str(b.workspace_id));
-      if (!ws) return fail('Workspace not found.', 404);
-      wsId = ws.id;
-    }
-    const plain = clientApiKey();
-    const row = {
-      id: uuid(), client_id: client.id, workspace_id: wsId,
-      label: str(b.label || 'Default key', 120),
-      key_prefix: plain.slice(0, 16),
-      key_hash: await sha256(plain),
-      daily_limit: Math.max(0, Number(b.daily_limit ?? Number(env.DEFAULT_DAILY_LIMIT || 1000))),
-      status: 'active', last_used_at: null, created_at: nowIso(), revoked_at: null
-    };
-    await insert(env, 'cx_api_keys', row);
-    await auditOp(env, op, 'issue API key', 'client', client.id, { label: row.label, prefix: row.key_prefix });
-    // The plain key is returned exactly once.
-    return json({ ok: true, api_key: plain, key: { ...row, key_hash: undefined } }, 201);
-  }
-  if (path.match(/^control\/keys\/[^/]+\/revoke$/) && method === 'POST') {
-    if (!ownerOnly(op)) return fail('Only the owner can revoke API keys.', 403);
-    const id = decodeURIComponent(path.split('/')[2]);
-    const k = await get(env, 'SELECT * FROM cx_api_keys WHERE id = ?', id);
-    if (!k) return fail('API key not found.', 404);
-    await update(env, 'cx_api_keys', { status: 'revoked', revoked_at: nowIso() }, 'id = ?', id);
-    await auditOp(env, op, 'revoke API key', 'client', k.client_id, { prefix: k.key_prefix });
-    return json({ ok: true });
   }
 
   /* ---------------- releases (ConnectX app store) --------------------- */
@@ -610,7 +666,6 @@ export async function controlRoutes(ctx) {
     // masked by GET control/email — never leak it through generic settings.
     for (const r of rows) if (r.setting_key !== 'email') out[r.setting_key] = parseJson(r.setting_value, null);
     out.sms ||= {};
-    // merge default templates per workspace for display
     return json({ ...out, defaultTemplates: DEFAULT_TEMPLATES });
   }
   if (path === 'control/settings' && method === 'PATCH') {
@@ -758,9 +813,10 @@ export async function controlRoutes(ctx) {
 function jobView(j) {
   return {
     id: j.id, channel: j.channel || 'sms', status: j.status,
-    workspace_id: j.workspace_id, workspace_name: j.workspace_name || null, workspace_code: j.workspace_code || null,
-    client_id: j.client_id || null, client_name: j.client_name || null, client_key: j.client_key || null,
+    shop_id: j.shop_id, shop_name: j.shop_name || null, shop_external_id: j.shop_external_id || null,
+    system_id: j.system_id || null, system_name: j.system_name || null, system_key: j.system_key || null,
     to_phone: j.to_phone || null,
+    to: j.channel === 'email' ? (parseJson(j.to_emails, []) || []).join(', ') : (j.to_phone || null),
     to_emails: j.channel === 'email' ? parseJson(j.to_emails, []) : null,
     subject: j.subject || null,
     recipient_name: j.recipient_name || null,

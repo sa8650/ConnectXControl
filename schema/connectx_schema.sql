@@ -1,14 +1,25 @@
 -- =====================================================================
 -- ConnectX Control — independent platform schema (Cloudflare D1 / SQLite)
 -- =====================================================================
--- ConnectX is a standalone communication-gateway platform. It has its own
--- accounts, workspaces, devices, message jobs, client apps and releases.
--- Nothing here references EMS tables. External products (EMS, CareOS,
--- InfluenceOS, PlugX, ...) integrate through cx_clients + cx_api_keys.
+-- ConnectX is a standalone communication-gateway platform:
+--
+--   * SYSTEMS  (cx_systems)  — the allied products whose administrators
+--     use the Android gateway (EMS today; InfluenceOS, CareOS, PlugX...).
+--     Each system's API URL + auth paths are configured centrally here;
+--     the Android app never stores or calls them directly.
+--   * ADMINS   (cx_admins)   — administrators verified THROUGH a system
+--     (federated login: app → ConnectX → system API). No passwords are
+--     stored; only a short-lived system session token for shop re-sync.
+--   * SHOPS    (cx_shops)    — the shops an administrator may connect a
+--     gateway to, synced from the system (or provisioned manually).
+--   * DEVICES  (cx_devices)  — paired Android gateway phones (per shop).
+--   * JOBS     (cx_jobs)     — unified outbound messages (SMS + email).
+--
+-- Nothing here references another product's database. External products
+-- push work through cx_systems + cx_api_keys and receive webhook results.
 -- =====================================================================
 
--- Control-panel accounts (owner + operators). The Android gateway signs in
--- with an operator account; it never uses another product's credentials.
+-- Control-panel accounts (owner + operators) for the website itself.
 CREATE TABLE IF NOT EXISTS cx_operators (
   id            TEXT PRIMARY KEY,
   name          TEXT NOT NULL,
@@ -24,24 +35,66 @@ CREATE TABLE IF NOT EXISTS cx_operators (
   updated_at    TEXT NOT NULL
 );
 
--- Workspaces are the tenants a gateway device is paired to
--- (the device API still reports them under the legacy "shops" key).
-CREATE TABLE IF NOT EXISTS cx_workspaces (
-  id         TEXT PRIMARY KEY,
-  name       TEXT NOT NULL,
-  code       TEXT NOT NULL UNIQUE,
-  address    TEXT NOT NULL DEFAULT '',
-  phone      TEXT NOT NULL DEFAULT '',
-  status     TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','paused')),
-  created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+-- Integrated systems (EMS, InfluenceOS, CareOS, PlugX, custom...).
+-- The Android app shows active systems on its sign-in screen; ConnectX
+-- calls api_url/login_path to verify administrators and api_url/shops_path
+-- to list their shops. Defaults match the shared DoxTox API convention.
+CREATE TABLE IF NOT EXISTS cx_systems (
+  id          TEXT PRIMARY KEY,
+  system_key  TEXT NOT NULL UNIQUE,
+  name        TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  api_url     TEXT NOT NULL DEFAULT '',
+  login_path  TEXT NOT NULL DEFAULT 'api/auth/admin/login',
+  shops_path  TEXT NOT NULL DEFAULT 'api/connectx/gateway/shops',
+  webhook_url TEXT,
+  status      TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','disabled')),
+  created_at  TEXT NOT NULL,
+  updated_at  TEXT NOT NULL
 );
 
--- Paired Android gateway devices.
+-- Administrators of external systems, verified through federated login.
+-- system_token is the LIVE session token issued by that system (used to
+-- re-sync shops); it expires and is then replaced by a fresh sign-in.
+CREATE TABLE IF NOT EXISTS cx_admins (
+  id               TEXT PRIMARY KEY,
+  system_id        TEXT NOT NULL,
+  external_id      TEXT,
+  email            TEXT NOT NULL,
+  name             TEXT NOT NULL DEFAULT '',
+  admin_code       TEXT,
+  system_token     TEXT,
+  system_token_exp TEXT,
+  last_login_at    TEXT,
+  created_at       TEXT NOT NULL,
+  UNIQUE (system_id, email)
+);
+CREATE INDEX IF NOT EXISTS idx_cx_admins_system ON cx_admins(system_id);
+
+-- Shops synced from a system (or provisioned manually by the owner).
+-- external_id is the shop's id inside that system (opaque to ConnectX).
+CREATE TABLE IF NOT EXISTS cx_shops (
+  id            TEXT PRIMARY KEY,
+  system_id     TEXT NOT NULL,
+  external_id   TEXT NOT NULL,
+  name          TEXT NOT NULL,
+  shop_code     TEXT NOT NULL DEFAULT '',
+  address       TEXT NOT NULL DEFAULT '',
+  phone         TEXT NOT NULL DEFAULT '',
+  category      TEXT NOT NULL DEFAULT '',
+  system_status TEXT NOT NULL DEFAULT 'active',  -- last value reported by the system
+  status        TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','paused')),
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL,
+  UNIQUE (system_id, external_id)
+);
+CREATE INDEX IF NOT EXISTS idx_cx_shops_system ON cx_shops(system_id, status);
+
+-- Paired Android gateway devices (one shop per device registration).
 CREATE TABLE IF NOT EXISTS cx_devices (
   id                  TEXT PRIMARY KEY,
-  workspace_id        TEXT NOT NULL,
-  operator_id         TEXT,
+  shop_id             TEXT NOT NULL,
+  admin_id            TEXT,
   device_public_id    TEXT NOT NULL UNIQUE,
   device_name         TEXT,
   android_version     TEXT,
@@ -56,39 +109,27 @@ CREATE TABLE IF NOT EXISTS cx_devices (
   created_at          TEXT NOT NULL,
   updated_at          TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_cx_devices_ws     ON cx_devices(workspace_id, status);
-CREATE INDEX IF NOT EXISTS idx_cx_devices_seen   ON cx_devices(last_seen DESC);
+CREATE INDEX IF NOT EXISTS idx_cx_devices_shop ON cx_devices(shop_id, status);
+CREATE INDEX IF NOT EXISTS idx_cx_devices_seen ON cx_devices(last_seen DESC);
 
--- Short-lived pairing codes (alternative to operator sign-in on the phone).
+-- Short-lived pairing codes (alternative to administrator sign-in on the
+-- phone). A code is bound to one shop of one system.
 CREATE TABLE IF NOT EXISTS cx_pairing_codes (
-  id           TEXT PRIMARY KEY,
-  code         TEXT NOT NULL UNIQUE,
-  workspace_id TEXT NOT NULL,
-  created_by   TEXT,
-  device_id    TEXT,
-  expires_at   TEXT NOT NULL,
-  used_at      TEXT,
-  created_at   TEXT NOT NULL
+  id         TEXT PRIMARY KEY,
+  code       TEXT NOT NULL UNIQUE,
+  shop_id    TEXT NOT NULL,
+  created_by TEXT,
+  device_id  TEXT,
+  expires_at TEXT NOT NULL,
+  used_at    TEXT,
+  created_at TEXT NOT NULL
 );
 
--- Integrated client products (EMS, CareOS, InfluenceOS, PlugX, custom...).
-CREATE TABLE IF NOT EXISTS cx_clients (
-  id          TEXT PRIMARY KEY,
-  client_key  TEXT NOT NULL UNIQUE,
-  name        TEXT NOT NULL,
-  description TEXT NOT NULL DEFAULT '',
-  webhook_url TEXT,
-  status      TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','disabled')),
-  created_at  TEXT NOT NULL,
-  updated_at  TEXT NOT NULL
-);
-
--- API keys handed to client products. Only the SHA-256 hash is stored;
--- the plain key is shown once at creation time.
+-- API keys handed to systems for the client API. Only the SHA-256 hash is
+-- stored; the plain key is shown once at creation time.
 CREATE TABLE IF NOT EXISTS cx_api_keys (
   id           TEXT PRIMARY KEY,
-  client_id    TEXT NOT NULL,
-  workspace_id TEXT,                       -- NULL = every workspace
+  system_id    TEXT NOT NULL,
   label        TEXT NOT NULL DEFAULT '',
   key_prefix   TEXT NOT NULL,
   key_hash     TEXT NOT NULL UNIQUE,
@@ -98,18 +139,18 @@ CREATE TABLE IF NOT EXISTS cx_api_keys (
   created_at   TEXT NOT NULL,
   revoked_at   TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_cx_keys_client ON cx_api_keys(client_id, status);
+CREATE INDEX IF NOT EXISTS idx_cx_keys_system ON cx_api_keys(system_id, status);
 
--- Unified outbound message jobs (SMS today; email history; future channels).
+-- Unified outbound message jobs (SMS + email).
 CREATE TABLE IF NOT EXISTS cx_jobs (
   id                TEXT PRIMARY KEY,
-  workspace_id      TEXT NOT NULL,
-  client_id         TEXT,
+  shop_id           TEXT NOT NULL,
+  system_id         TEXT,
   api_key_id        TEXT,
   channel           TEXT NOT NULL DEFAULT 'sms' CHECK (channel IN ('sms','email')),
   -- SMS
   to_phone          TEXT,
-  -- Email (read-only history pushed by clients)
+  -- Email
   from_email        TEXT,
   to_emails         TEXT,                   -- JSON array
   cc_emails         TEXT,                   -- JSON array
@@ -123,8 +164,8 @@ CREATE TABLE IF NOT EXISTS cx_jobs (
   recipient_name    TEXT,
   message_type      TEXT,
   event_type        TEXT,
-  reference_id      TEXT,                   -- client-side id (invoice, order...)
-  reference_number  TEXT,                   -- client-side human number
+  reference_id      TEXT,                   -- caller-side id (invoice, order...)
+  reference_number  TEXT,                   -- caller-side human number
   message_body      TEXT,
   status            TEXT NOT NULL DEFAULT 'queued'
                     CHECK (status IN ('queued','sending','sent','failed','cancelled')),
@@ -139,10 +180,10 @@ CREATE TABLE IF NOT EXISTS cx_jobs (
   sent_at           TEXT
 );
 -- NULL idempotency keys never collide (SQLite treats NULLs as distinct).
-CREATE UNIQUE INDEX IF NOT EXISTS idx_cx_jobs_idem    ON cx_jobs(workspace_id, client_id, idempotency_key);
-CREATE INDEX IF NOT EXISTS idx_cx_jobs_claim          ON cx_jobs(workspace_id, channel, status, created_at);
-CREATE INDEX IF NOT EXISTS idx_cx_jobs_ws_created     ON cx_jobs(workspace_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_cx_jobs_client_created ON cx_jobs(client_id, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cx_jobs_idem    ON cx_jobs(shop_id, system_id, idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_cx_jobs_claim          ON cx_jobs(shop_id, channel, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_cx_jobs_shop_created   ON cx_jobs(shop_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_cx_jobs_system_created ON cx_jobs(system_id, created_at DESC);
 
 -- ConnectX update channel (replaces the old EMS App Store dependency).
 CREATE TABLE IF NOT EXISTS cx_releases (
@@ -178,7 +219,7 @@ CREATE TABLE IF NOT EXISTS cx_sim_carriers (
 );
 
 -- Key/value platform settings (JSON values).
---   'sms'   → per-workspace gateway toggles + message templates
+--   'sms'   → global gateway toggle + message templates ({enabled, templates})
 --   'email' → provider config for the email gateway (owner-only; the API
 --             key stored here is never returned by any GET endpoint)
 CREATE TABLE IF NOT EXISTS cx_settings (

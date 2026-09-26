@@ -1,30 +1,31 @@
 /* =====================================================================
    ConnectX Device API — the ONLY backend the ConnectX Android gateway
-   talks to. There is no EMS involvement anywhere in this file.
+   talks to. The app never stores or calls another product's URLs.
 
    Auth models:
-   · Operator token (HMAC signed, from device/auth/login) — used during
-     sign-in and workspace selection, same UX the phone app already has.
-   · Device token  (opaque `cxd_...`, SHA-256 hash stored in cx_devices)
-     — used by a paired gateway for claim/report/stats/emails.
-   · Pairing code  (generated on the control website) — alternative,
-     account-free pairing for a phone.
+   · Federated administrator — the phone user is an administrator of an
+     integrated SYSTEM (EMS today; InfluenceOS, CareOS, PlugX...).
+     Sign-in: app → ConnectX → that system's API (configured centrally
+     on the control website). ConnectX then issues its own short-lived
+     admin session token and syncs the administrator's shops.
+   · Device token — opaque `cxd_...` (SHA-256 hash stored in cx_devices)
+     for a paired gateway: claim/report/stats/emails.
+   · Pairing code — account-free alternative generated on the website,
+     bound to one shop.
 
-   JSON response shapes intentionally mirror the previous gateway so the
-   Android client is a thin re-point, while all data now lives in
-   ConnectX's own D1 database.
+   There is no workspace concept: a device belongs to a SHOP of a SYSTEM.
    ===================================================================== */
-import { all, get, insert, update, parseJson } from './db.js';
+import { all, get, insert, update, run, parseJson } from './db.js';
 import {
   json, fail, uuid, nowIso, str, bool, cleanPhone, isUuid, dayStart, onlineOf,
-  signToken, verifyToken, bearerOf, hashPassword, checkPassword, sha256,
-  deviceToken as newDeviceToken, pairingCode
+  signToken, verifyToken, bearerOf, sha256,
+  deviceToken as newDeviceToken
 } from './core.js';
 import { logActivity } from './audit.js';
 import { dispatchWebhook } from './webhook.js';
 
-const OPERATOR_TTL = 60 * 60 * 8;          // 8h operator sessions
-const DEVICE_TTL = 60 * 60 * 24 * 400;     // device tokens: ~13 months
+const ADMIN_TTL = 60 * 60 * 8;             // ConnectX admin sessions (aligns with system tokens)
+const SYSTEM_CALL_TIMEOUT = 15000;         // server-to-server system API calls
 const EMAIL_PAGE_SIZE = 30;
 
 /* ---------- public shapes ---------- */
@@ -32,7 +33,7 @@ export function publicOperator(o) {
   if (!o) return null;
   return {
     id: o.id,
-    admin_code: o.operator_code || null,   // legacy key kept for the phone app
+    admin_code: o.operator_code || null,
     name: o.name || '',
     email: o.email || '',
     phone: o.phone || '',
@@ -43,9 +44,35 @@ export function publicOperator(o) {
   };
 }
 
-export function publicWorkspace(w) {
-  if (!w) return null;
-  return { id: w.id, name: w.name, address: w.address || '', phone: w.phone || '', code: w.code || '', shop_code: w.code || '' };
+export function publicSystem(s) {
+  if (!s) return null;
+  return { id: s.id, key: s.system_key, name: s.name };
+}
+
+export function publicAdmin(a) {
+  if (!a) return null;
+  return {
+    id: a.id,
+    external_id: a.external_id || null,
+    email: a.email || '',
+    name: a.name || '',
+    admin_code: a.admin_code || null
+  };
+}
+
+export function publicShop(s) {
+  if (!s) return null;
+  return {
+    id: s.id,
+    external_id: s.external_id,
+    name: s.name,
+    shop_code: s.shop_code || '',
+    address: s.address || '',
+    phone: s.phone || '',
+    category: s.category || '',
+    status: s.status,
+    system_status: s.system_status || 'active'
+  };
 }
 
 export function publicDevice(d) {
@@ -63,8 +90,7 @@ export function publicDevice(d) {
     is_primary: bool(d.is_primary),
     last_seen: d.last_seen,
     created_at: d.created_at,
-    store_id: d.workspace_id,              // legacy key kept for the phone app
-    workspace_id: d.workspace_id
+    shop_id: d.shop_id
   };
 }
 
@@ -90,13 +116,93 @@ export function publicEmail(row, detail = false) {
   };
 }
 
-/* ---------- auth helpers ---------- */
-export async function operatorSession(env, request) {
+/* ---------- system (federated) helpers ---------- */
+
+/** Server-to-server call into an integrated system. Tests may inject env.SYSTEM_FETCH. */
+async function systemFetch(env, system, path, options = {}) {
+  const f = env.SYSTEM_FETCH || fetch;
+  const base = String(system.api_url || '').replace(/\/+$/, '');
+  const p = String(path || '').replace(/^\/+/, '');
+  if (!base) throw new Error('system api_url not configured');
+  return f(`${base}/${p}`, { ...options, signal: AbortSignal.timeout(SYSTEM_CALL_TIMEOUT) });
+}
+
+/** Read `exp` (unix seconds) from an HS256 JWT payload without verifying it
+    (verification already happened inside the issuing system). */
+function jwtExp(token) {
+  try {
+    const payload = String(token).split('.')[1];
+    if (!payload) return null;
+    const b64 = payload.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - payload.length % 4) % 4);
+    const claims = JSON.parse(atob(b64));
+    return Number(claims.exp) > 0 ? Number(claims.exp) : null;
+  } catch { return null; }
+}
+
+/** Pull the administrator's shops from the system and upsert cx_shops. */
+async function syncAdminShops(env, system, admin) {
+  let res;
+  try {
+    res = await systemFetch(env, system, system.shops_path, {
+      headers: { authorization: 'Bearer ' + admin.system_token }
+    });
+  } catch {
+    return { error: fail(`Could not reach ${system.name} to load shops. Check its API URL in ConnectX Control.`, 502) };
+  }
+  const out = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    if (res.status === 401 || res.status === 403)
+      return { error: fail(`${system.name} session expired or was rejected. Please sign in again.`, 401) };
+    return { error: fail(String(out.error || `${system.name} could not list shops.`).slice(0, 300), 502) };
+  }
+  const list = Array.isArray(out.shops) ? out.shops : [];
+  for (const st of list) {
+    const externalId = str(st.id || st.store_id || '', 80);
+    if (!externalId) continue;
+    await run(env,
+      `INSERT INTO cx_shops (id, system_id, external_id, name, shop_code, address, phone, category, system_status, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+       ON CONFLICT(system_id, external_id) DO UPDATE SET
+         name = excluded.name, shop_code = excluded.shop_code, address = excluded.address,
+         phone = excluded.phone, category = excluded.category,
+         system_status = excluded.system_status, updated_at = excluded.updated_at`,
+      uuid(), system.id, externalId,
+      str(st.name || externalId, 160), str(st.shop_code || '', 60), str(st.address || '', 240),
+      str(st.phone || '', 32), str(st.category || '', 80), str(st.status || 'active', 20),
+      nowIso(), nowIso());
+  }
+  // Every shop known for this system — including ones auto-registered by the client API.
+  const rows = await all(env, 'SELECT * FROM cx_shops WHERE system_id = ? ORDER BY name ASC', system.id);
+  const mine = rows;
+  const devices = await all(env,
+    "SELECT * FROM cx_devices WHERE admin_id = ? AND status != 'revoked'", admin.id);
+  const byShop = {};
+  for (const d of devices) (byShop[d.shop_id] ||= []).push(publicDevice(d));
+  return {
+    administrator: out.administrator ? {
+      id: admin.id,
+      external_id: out.administrator.id || admin.external_id,
+      admin_code: out.administrator.admin_code || admin.admin_code || null,
+      name: out.administrator.name || admin.name || '',
+      email: out.administrator.email || admin.email || ''
+    } : publicAdmin(admin),
+    shops: mine.map(s => ({
+      ...publicShop(s),
+      connected: (byShop[s.id] || []).some(d => d.status === 'active' || d.status === 'pending_test'),
+      devices: byShop[s.id] || []
+    }))
+  };
+}
+
+/* ---------- sessions ---------- */
+async function adminSession(env, request) {
   const payload = await verifyToken(bearerOf(request), env.SESSION_SECRET);
-  if (!payload || !['owner', 'operator'].includes(payload.role)) return null;
-  const op = await get(env, 'SELECT * FROM cx_operators WHERE id = ?', payload.id);
-  if (!op || !bool(op.active)) return null;
-  return op;
+  if (!payload || payload.role !== 'system_admin') return null;
+  const admin = await get(env, 'SELECT * FROM cx_admins WHERE id = ?', payload.id);
+  if (!admin) return null;
+  const system = await get(env, 'SELECT * FROM cx_systems WHERE id = ?', admin.system_id);
+  if (!system || system.status !== 'active') return null;
+  return { admin, system };
 }
 
 export async function deviceSession(env, request) {
@@ -112,29 +218,29 @@ async function touchDevice(env, deviceId, patch = {}) {
   await update(env, 'cx_devices', { last_seen: nowIso(), updated_at: nowIso(), ...patch }, 'id = ?', deviceId).catch(() => {});
 }
 
-async function workspaceFor(env, device) {
-  return get(env, 'SELECT * FROM cx_workspaces WHERE id = ?', device.workspace_id);
+async function shopFor(env, device) {
+  return get(env, 'SELECT * FROM cx_shops WHERE id = ?', device.shop_id);
 }
 
-async function operatorFor(env, device) {
-  if (!device.operator_id) return null;
-  return get(env, 'SELECT * FROM cx_operators WHERE id = ?', device.operator_id);
+async function adminFor(env, device) {
+  if (!device.admin_id) return null;
+  return get(env, 'SELECT * FROM cx_admins WHERE id = ?', device.admin_id);
 }
 
 /* ---------- device registration / pairing (shared) ---------- */
-async function createDevice(env, { workspace, operator, b, viaPairing = false }) {
+async function createDevice(env, { shop, admin, b, viaPairing = false }) {
   const existing = await all(env,
-    "SELECT id FROM cx_devices WHERE workspace_id = ? AND status != 'revoked'", workspace.id);
+    "SELECT id FROM cx_devices WHERE shop_id = ? AND status != 'revoked'", shop.id);
   const isPrimary = existing.length === 0 || bool(b.isPrimary);
   if (isPrimary) {
-    await update(env, 'cx_devices', { is_primary: 0 }, 'workspace_id = ? AND is_primary = 1', workspace.id).catch(() => {});
+    await update(env, 'cx_devices', { is_primary: 0 }, 'shop_id = ? AND is_primary = 1', shop.id).catch(() => {});
   }
   const id = uuid();
   const token = newDeviceToken();
   const row = {
     id,
-    workspace_id: workspace.id,
-    operator_id: operator ? operator.id : null,
+    shop_id: shop.id,
+    admin_id: admin ? admin.id : null,
     device_public_id: 'CX-' + id.replaceAll('-', '').slice(0, 10).toUpperCase(),
     device_name: str(b.deviceName || b.device_name || 'Android gateway', 120),
     android_version: str(b.androidVersion || b.android_version || '', 40) || null,
@@ -151,12 +257,12 @@ async function createDevice(env, { workspace, operator, b, viaPairing = false })
   };
   await insert(env, 'cx_devices', row);
   await logActivity(env, {
-    actorType: operator ? 'operator' : 'system',
-    actorId: operator ? operator.id : null,
-    actorLabel: operator ? operator.name : (viaPairing ? 'Pairing code' : 'System'),
+    actorType: admin ? 'admin' : 'system',
+    actorId: admin ? admin.id : null,
+    actorLabel: admin ? `${admin.name || admin.email}` : (viaPairing ? 'Pairing code' : 'System'),
     action: viaPairing ? 'pair gateway device' : 'register gateway device',
     entityType: 'device', entityId: id,
-    meta: { device_name: row.device_name, workspace: workspace.name, phone: row.phone_number }
+    meta: { device_name: row.device_name, shop: shop.name, phone: row.phone_number }
   });
   return { device: row, token };
 }
@@ -166,25 +272,106 @@ export async function deviceRoutes(ctx) {
   const { env, request, path, method, url } = ctx;
   const body = async () => { try { return await request.json(); } catch { return {}; } };
 
-  /* ---------------- operator sign-in (phone app login screen) ---------- */
-  if (path === 'device/auth/login' && method === 'POST') {
-    const b = await body();
-    const email = str(b.email || '').toLowerCase();
-    const op = await get(env, 'SELECT * FROM cx_operators WHERE email = ?', email);
-    if (!op) return fail('Wrong email or password.', 401);
-    if (!bool(op.active)) return fail('This ConnectX account is deactivated. Contact the platform owner.', 403);
-    if (!await checkPassword(b.password || '', op.password_hash)) return fail('Wrong email or password.', 401);
-    await update(env, 'cx_operators', { last_login_at: nowIso() }, 'id = ?', op.id).catch(() => {});
-    const token = await signToken(
-      { id: op.id, role: op.role, email: op.email, exp: Math.floor(Date.now() / 1000) + OPERATOR_TTL },
-      env.SESSION_SECRET);
-    return json({ token, user: publicOperator(op), role: 'admin' }); // legacy role key kept for the phone app
+  /* ---------------- system list (phone app "System" dropdown) ---------- */
+  if (path === 'device/systems' && method === 'GET') {
+    const rows = await all(env,
+      "SELECT system_key, name, description, api_url, status FROM cx_systems WHERE status = 'active' ORDER BY created_at ASC");
+    return json({
+      systems: rows.map(r => ({
+        key: r.system_key, name: r.name, description: r.description || '',
+        available: !!r.api_url        // false → owner has not connected it yet
+      }))
+    });
   }
 
-  if (path === 'device/auth/profile' && method === 'GET') {
-    const op = await operatorSession(env, request);
-    if (!op) return fail('Please sign in.', 401);
-    return json(publicOperator(op));
+  /* ---------------- federated administrator sign-in -------------------- */
+  if (path === 'device/auth/login' && method === 'POST') {
+    const b = await body();
+    const sysKey = str(b.system || b.systemKey || b.system_key || '', 60).toLowerCase();
+    const email = str(b.email || b.userId || b.user_id || '').toLowerCase();
+    const password = String(b.password || '');
+    if (!sysKey) return fail('Select the system where your account is registered.', 400);
+    if (!email || !password) return fail('Email and password are required.', 400);
+
+    const system = await get(env, 'SELECT * FROM cx_systems WHERE system_key = ? OR id = ?', sysKey, sysKey);
+    if (!system || system.status !== 'active') return fail('That system is not available in ConnectX.', 404);
+    if (!system.api_url)
+      return fail(`${system.name} is not connected yet. The ConnectX owner must configure its API URL first.`, 503);
+
+    let res;
+    try {
+      res = await systemFetch(env, system, system.login_path, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ email, password })
+      });
+    } catch {
+      return fail(`Could not reach ${system.name}. The ConnectX owner should check its API URL.`, 502);
+    }
+    const out = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const status = res.status === 401 ? 401 : res.status === 403 ? 403 : 502;
+      return fail(String(out.error || `${system.name} rejected the sign-in.`).slice(0, 300), status);
+    }
+    const systemToken = String(out.token || '');
+    const user = out.user || {};
+    if (!systemToken || !user.id) return fail(`${system.name} returned an unexpected response.`, 502);
+    if (out.role && !['admin', 'owner'].includes(String(out.role)))
+      return fail(`Administrator sign-in required for ${system.name}.`, 403);
+
+    // Upsert the local administrator mirror (no password is ever stored).
+    const exp = jwtExp(systemToken);
+    const tokenExp = exp
+      ? new Date(exp * 1000).toISOString()
+      : new Date(Date.now() + ADMIN_TTL * 1000).toISOString();
+    const fields = {
+      external_id: str(user.id, 80),
+      name: str(user.name || '', 160),
+      admin_code: user.admin_code != null ? str(user.admin_code, 40) : null,
+      system_token: systemToken,
+      system_token_exp: tokenExp,
+      last_login_at: nowIso()
+    };
+    const existing = await get(env, 'SELECT * FROM cx_admins WHERE system_id = ? AND email = ?', system.id, email);
+    let admin;
+    if (existing) {
+      await update(env, 'cx_admins', fields, 'id = ?', existing.id);
+      admin = { ...existing, ...fields };
+    } else {
+      admin = { id: uuid(), system_id: system.id, email, ...fields, created_at: nowIso() };
+      await insert(env, 'cx_admins', admin);
+    }
+
+    // Load (and cache) this administrator's shops from the system.
+    const synced = await syncAdminShops(env, system, admin);
+    if (synced.error) return synced.error;
+
+    const token = await signToken(
+      { id: admin.id, role: 'system_admin', system: system.id, email, exp: Math.floor(Date.now() / 1000) + ADMIN_TTL },
+      env.SESSION_SECRET);
+    await logActivity(env, {
+      actorType: 'admin', actorId: admin.id, actorLabel: `${admin.name || email} via ${system.name}`,
+      action: 'administrator sign-in', entityType: 'session', entityId: admin.id,
+      meta: { system: system.system_key, shops: synced.shops.length }
+    });
+    return json({
+      token,
+      admin: publicAdmin(admin),
+      administrator: synced.administrator,        // richer shape echoed from the system
+      system: publicSystem(system),
+      shops: synced.shops
+    });
+  }
+
+  /* ---------------- shop list refresh (admin session) ------------------ */
+  if (path === 'device/shops' && method === 'GET') {
+    const sess = await adminSession(env, request);
+    if (!sess) return fail('Administrator sign-in required.', 403);
+    if (!sess.admin.system_token || new Date(sess.admin.system_token_exp || 0).getTime() < Date.now())
+      return fail(`${sess.system.name} session expired. Please sign in again.`, 401);
+    const synced = await syncAdminShops(env, sess.system, sess.admin);
+    if (synced.error) return synced.error;
+    return json({ administrator: synced.administrator, system: publicSystem(sess.system), shops: synced.shops });
   }
 
   /* ---------------- pairing code (account-free phone pairing) ---------- */
@@ -199,48 +386,40 @@ export async function deviceRoutes(ctx) {
     if (!pair || pair.used_at) return fail('This pairing code was already used. Generate a new one in ConnectX Control.', 404);
     if (new Date(pair.expires_at).getTime() < Date.now())
       return fail('This pairing code expired. Generate a new one in ConnectX Control.', 410);
-    const workspace = await get(env, 'SELECT * FROM cx_workspaces WHERE id = ?', pair.workspace_id);
-    if (!workspace || workspace.status !== 'active') return fail('That workspace is not active.', 404);
-    const { device, token } = await createDevice(env, { workspace, operator: null, b, viaPairing: true });
+    const shop = await get(env, 'SELECT * FROM cx_shops WHERE id = ?', pair.shop_id);
+    if (!shop || shop.status !== 'active' || shop.system_status === 'inactive')
+      return fail('That shop is not active.', 404);
+    const system = await get(env, "SELECT * FROM cx_systems WHERE id = ? AND status = 'active'", shop.system_id);
+    if (!system) return fail('The system for this pairing code is not active.', 404);
+    const { device, token } = await createDevice(env, { shop, admin: null, b, viaPairing: true });
     await update(env, 'cx_pairing_codes', { used_at: nowIso(), device_id: device.id }, 'id = ?', pair.id).catch(() => {});
     return json({
       device: publicDevice(device),
       deviceToken: token,
-      shop: publicWorkspace(workspace),          // legacy key kept for the phone app
-      workspace: publicWorkspace(workspace),
+      shop: publicShop(shop),
+      system: publicSystem(system),
       administrator: null
     }, 201);
   }
 
-  /* ---------------- workspace list (phone app "shops" screen) ---------- */
-  if (path === 'device/workspaces' && method === 'GET') {
-    const op = await operatorSession(env, request);
-    if (!op) return fail('ConnectX sign-in required.', 403);
-    const workspaces = await all(env, "SELECT * FROM cx_workspaces WHERE status = 'active' ORDER BY created_at DESC");
-    const devices = await all(env,
-      "SELECT * FROM cx_devices WHERE operator_id = ? AND status != 'revoked'", op.id);
-    const connected = new Set(devices.map(d => d.workspace_id));
-    return json({
-      administrator: publicOperator(op),
-      shops: workspaces.map(w => ({ ...publicWorkspace(w), connected: connected.has(w.id) })) // legacy key kept for the phone app
-    });
-  }
-
-  /* ---------------- device registration (phone app setup) -------------- */
+  /* ---------------- device registration (admin session) ---------------- */
   if (path === 'device/register' && method === 'POST') {
-    const op = await operatorSession(env, request);
-    if (!op) return fail('ConnectX sign-in required.', 403);
+    const sess = await adminSession(env, request);
+    if (!sess) return fail('Administrator sign-in required.', 403);
     const b = await body();
-    const wsId = str(b.storeId || b.workspaceId || b.workspace_id || '');
-    if (!wsId) return fail('Workspace is required.', 400);
-    const workspace = await get(env, "SELECT * FROM cx_workspaces WHERE id = ? AND status = 'active'", wsId);
-    if (!workspace) return fail('Workspace not found.', 404);
-    const { device, token } = await createDevice(env, { workspace, operator: op, b });
+    const shopId = str(b.shopId || b.shop_id || b.storeId || '');
+    if (!shopId) return fail('Shop is required.', 400);
+    const shop = await get(env, 'SELECT * FROM cx_shops WHERE id = ? OR external_id = ?', shopId, shopId);
+    if (!shop || shop.system_id !== sess.system.id) return fail('Shop not found for this administrator.', 404);
+    if (shop.status !== 'active') return fail('This shop is paused in ConnectX Control.', 403);
+    if (shop.system_status === 'inactive') return fail('This shop is deactivated in ' + sess.system.name + '.', 403);
+    const { device, token } = await createDevice(env, { shop, admin: sess.admin, b });
     return json({
       device: publicDevice(device),
       deviceToken: token,
-      shop: publicWorkspace(workspace),          // legacy key kept for the phone app
-      administrator: publicOperator(op)
+      shop: publicShop(shop),
+      system: publicSystem(sess.system),
+      administrator: publicAdmin(sess.admin)
     }, 201);
   }
 
@@ -249,24 +428,25 @@ export async function deviceRoutes(ctx) {
      ===================================================================== */
   const device = await deviceSession(env, request);
   if (!device) {
-    const isDevicePath = path.startsWith('device/');
-    if (isDevicePath) return fail('Device not connected. Pair this phone again in ConnectX Control.', 403);
+    if (path.startsWith('device/')) return fail('Device not connected. Pair this phone again in ConnectX Control.', 403);
     return null;
   }
-  const workspace = await workspaceFor(env, device);
-  if (!workspace) return fail('The workspace for this device was removed.', 403);
-  if (workspace.status !== 'active') return fail('This workspace is paused. Resume it in ConnectX Control.', 403);
+  const shop = await shopFor(env, device);
+  if (!shop) return fail('The shop for this device was removed.', 403);
+  if (shop.status !== 'active') return fail('This shop is paused. Resume it in ConnectX Control.', 403);
+  if (shop.system_status === 'inactive') return fail('This shop is deactivated in its system.', 403);
+  const system = await get(env, 'SELECT * FROM cx_systems WHERE id = ?', shop.system_id);
 
   if (path === 'device/me' && method === 'GET') {
-    const op = await operatorFor(env, device);
-    const wsDevices = await all(env,
-      "SELECT workspace_id FROM cx_devices WHERE status != 'revoked' AND operator_id = ?", device.operator_id || '');
+    const admin = await adminFor(env, device);
+    const adminDevices = await all(env,
+      "SELECT shop_id FROM cx_devices WHERE status != 'revoked' AND admin_id = ?", device.admin_id || '');
     return json({
       device: publicDevice(device),
-      shop: publicWorkspace(workspace),
-      workspace: publicWorkspace(workspace),
-      administrator: publicOperator(op),
-      connectedStoreIds: [...new Set(wsDevices.map(x => x.workspace_id))]
+      shop: publicShop(shop),
+      system: publicSystem(system),
+      administrator: publicAdmin(admin),
+      connectedShopIds: [...new Set(adminDevices.map(x => x.shop_id))]
     });
   }
 
@@ -277,16 +457,16 @@ export async function deviceRoutes(ctx) {
     if (b.appVersion) patch.app_version = str(b.appVersion, 40);
     if (b.deviceName) patch.device_name = str(b.deviceName, 120);
     await touchDevice(env, device.id, patch);
-    const op = await operatorFor(env, device);
+    const admin = await adminFor(env, device);
     const settings = await get(env, "SELECT setting_value FROM cx_settings WHERE setting_key = 'sms'");
     const smsCfg = parseJson(settings?.setting_value, {}) || {};
-    const wsEnabled = smsCfg[workspace.id] ? smsCfg[workspace.id].enabled !== false : true;
     return json({
       ok: true,
       device: publicDevice({ ...device, ...patch, last_seen: nowIso() }),
-      shop: publicWorkspace(workspace),
-      administrator: publicOperator(op),
-      smsEnabled: wsEnabled
+      shop: publicShop(shop),
+      system: publicSystem(system),
+      administrator: publicAdmin(admin),
+      smsEnabled: smsCfg.enabled !== false
     });
   }
 
@@ -331,7 +511,7 @@ export async function deviceRoutes(ctx) {
       const phone = cleanPhone(b.phone || device.phone_number);
       if (phone) {
         await insert(env, 'cx_jobs', smsJobRow({
-          workspaceId: workspace.id, clientId: null, apiKeyId: null,
+          shopId: shop.id, systemId: null, apiKeyId: null,
           phone, name: 'Test', recipientType: 'manual',
           messageType: 'TEST', eventType: 'TEST',
           messageBody: str(b.message || `ConnectX test from gateway ${device.device_name || ''}.`, 1000),
@@ -354,13 +534,13 @@ export async function deviceRoutes(ctx) {
   /* ---------------- SMS job cancellation (queued only) ----------------- */
   const cancelJob = async jobId => {
     if (!jobId) return fail('jobId is required.', 400);
-    const job = await get(env, "SELECT * FROM cx_jobs WHERE id = ? AND workspace_id = ? AND channel = 'sms'", jobId, workspace.id);
-    if (!job) return fail('SMS job not found for this workspace.', 404);
+    const job = await get(env, "SELECT * FROM cx_jobs WHERE id = ? AND shop_id = ? AND channel = 'sms'", jobId, shop.id);
+    if (!job) return fail('SMS job not found for this shop.', 404);
     if (job.status !== 'queued') return fail('SMS is no longer queued. Refresh history before retrying.', 409);
     // Conditional guard: another gateway may claim the job between SELECT and UPDATE.
     const changes = await update(env, 'cx_jobs',
       { status: 'cancelled', error_message: 'Cancelled from gateway' },
-      "id = ? AND workspace_id = ? AND status = 'queued'", jobId, workspace.id);
+      "id = ? AND shop_id = ? AND status = 'queued'", jobId, shop.id);
     if (!changes) return fail('SMS was already claimed by a gateway. Refresh history.', 409);
     ctx.waitUntil?.(dispatchWebhook(env, { ...job, status: 'cancelled' }, 'job.cancelled'));
     return json({ ok: true, cancelled: true });
@@ -383,28 +563,28 @@ export async function deviceRoutes(ctx) {
     const stale = new Date(Date.now() - 10 * 60 * 1000).toISOString();
     await update(env, 'cx_jobs',
       { status: 'queued', claimed_at: null },
-      "workspace_id = ? AND channel = 'sms' AND status = 'sending' AND (claimed_at IS NULL OR claimed_at < ?)",
-      workspace.id, stale).catch(() => {});
+      "shop_id = ? AND channel = 'sms' AND status = 'sending' AND (claimed_at IS NULL OR claimed_at < ?)",
+      shop.id, stale).catch(() => {});
 
     const queued = await all(env,
-      `SELECT j.*, c.client_key, c.name AS client_name
-         FROM cx_jobs j LEFT JOIN cx_clients c ON c.id = j.client_id
-        WHERE j.workspace_id = ? AND j.channel = 'sms' AND j.status = 'queued'
-        ORDER BY j.created_at ASC LIMIT ?`, workspace.id, limit);
+      `SELECT j.*, s.system_key, s.name AS system_name
+         FROM cx_jobs j LEFT JOIN cx_systems s ON s.id = j.system_id
+        WHERE j.shop_id = ? AND j.channel = 'sms' AND j.status = 'queued'
+        ORDER BY j.created_at ASC LIMIT ?`, shop.id, limit);
 
     const claimed = [];
     for (const job of queued) {
       const attempts = Number(job.attempts || 0) + 1;
       const changes = await update(env, 'cx_jobs',
         { status: 'sending', device_id: device.id, claimed_at: nowIso(), attempts },
-        "id = ? AND workspace_id = ? AND status = 'queued'", job.id, workspace.id).catch(() => 0);
+        "id = ? AND shop_id = ? AND status = 'queued'", job.id, shop.id).catch(() => 0);
       // Only dispatch jobs this device actually won the claim race for.
       if (changes > 0) {
         claimed.push({
           id: job.id,
-          shop_id: workspace.id,               // legacy key kept for the phone app
-          workspace_id: workspace.id,
-          administrator_id: device.operator_id,
+          shop_id: shop.id,
+          shop_external_id: shop.external_id,
+          administrator_id: device.admin_id,
           phone_number: job.to_phone,
           message: job.message_body,
           event_type: job.event_type || job.message_type,
@@ -413,8 +593,8 @@ export async function deviceRoutes(ctx) {
           invoice_id: job.reference_id,        // legacy key kept for the phone app
           reference_id: job.reference_id,
           reference_number: job.reference_number,
-          client_key: job.client_key || null,
-          client_name: job.client_name || null,
+          system_key: job.system_key || null,
+          system_name: job.system_name || null,
           created_at: job.created_at,
           attempts
         });
@@ -429,8 +609,8 @@ export async function deviceRoutes(ctx) {
     const id = str(b.jobId || b.id || '');
     if (!id) return fail('jobId is required.', 400);
     const status = b.status === 'sent' ? 'sent' : 'failed';
-    const job = await get(env, "SELECT * FROM cx_jobs WHERE id = ? AND workspace_id = ? AND channel = 'sms'", id, workspace.id);
-    if (!job) return fail('SMS job not found for this workspace.', 404);
+    const job = await get(env, "SELECT * FROM cx_jobs WHERE id = ? AND shop_id = ? AND channel = 'sms'", id, shop.id);
+    if (!job) return fail('SMS job not found for this shop.', 404);
     if (job.device_id && job.device_id !== device.id && job.status === 'sent')
       return json({ ok: true, duplicate: true });
     const patch = {
@@ -439,7 +619,7 @@ export async function deviceRoutes(ctx) {
       error_message: status === 'failed' ? str(b.error || 'SMS could not be sent', 400) : null
     };
     if (status === 'sent') patch.sent_at = nowIso();
-    await update(env, 'cx_jobs', patch, "id = ? AND workspace_id = ?", id, workspace.id);
+    await update(env, 'cx_jobs', patch, 'id = ? AND shop_id = ?', id, shop.id);
     await touchDevice(env, device.id, { status: 'active' });
     ctx.waitUntil?.(dispatchWebhook(env, { ...job, ...patch }, status === 'sent' ? 'job.sent' : 'job.failed'));
     return json({ ok: true, status });
@@ -450,20 +630,21 @@ export async function deviceRoutes(ctx) {
     const today = dayStart(url.searchParams.get('utcOffsetMinutes'));
     if (!today) return fail('Invalid UTC offset.', 400);
     const [jobs, sentToday, last] = await Promise.all([
-      all(env, "SELECT id, status, sent_at, created_at FROM cx_jobs WHERE workspace_id = ? AND channel = 'sms' AND created_at >= ?", workspace.id, today),
-      all(env, "SELECT id FROM cx_jobs WHERE workspace_id = ? AND channel = 'sms' AND status = 'sent' AND sent_at >= ?", workspace.id, today),
-      all(env, "SELECT created_at, sent_at, status FROM cx_jobs WHERE workspace_id = ? AND channel = 'sms' ORDER BY created_at DESC LIMIT 1", workspace.id)
+      all(env, "SELECT id, status, sent_at, created_at FROM cx_jobs WHERE shop_id = ? AND channel = 'sms' AND created_at >= ?", shop.id, today),
+      all(env, "SELECT id FROM cx_jobs WHERE shop_id = ? AND channel = 'sms' AND status = 'sent' AND sent_at >= ?", shop.id, today),
+      all(env, "SELECT created_at, sent_at, status FROM cx_jobs WHERE shop_id = ? AND channel = 'sms' ORDER BY created_at DESC LIMIT 1", shop.id)
     ]);
     await touchDevice(env, device.id);
-    const op = await operatorFor(env, device);
+    const admin = await adminFor(env, device);
     return json({
       sent: sentToday.length + jobs.filter(j => j.status === 'sent' && !j.sent_at).length,
       failed: jobs.filter(j => j.status === 'failed').length,
       pending: jobs.filter(j => j.status === 'queued' || j.status === 'sending').length,
       lastActivity: last[0]?.sent_at || last[0]?.created_at || null,
       device: publicDevice(device),
-      shop: publicWorkspace(workspace),
-      administrator: publicOperator(op)
+      shop: publicShop(shop),
+      system: publicSystem(system),
+      administrator: publicAdmin(admin)
     });
   }
 
@@ -473,11 +654,11 @@ export async function deviceRoutes(ctx) {
     const since = range === 'today' ? dayStart(url.searchParams.get('utcOffsetMinutes')) : new Date(Date.now() - days * 86400000).toISOString();
     if (!since) return fail('Invalid UTC offset.', 400);
     const rows = await all(env,
-      `SELECT j.*, c.name AS client_name FROM cx_jobs j LEFT JOIN cx_clients c ON c.id = j.client_id
-        WHERE j.workspace_id = ? AND j.channel = 'sms' AND j.created_at >= ?
-        ORDER BY j.created_at DESC LIMIT 250`, workspace.id, since);
+      `SELECT j.*, s.name AS system_name FROM cx_jobs j LEFT JOIN cx_systems s ON s.id = j.system_id
+        WHERE j.shop_id = ? AND j.channel = 'sms' AND j.created_at >= ?
+        ORDER BY j.created_at DESC LIMIT 250`, shop.id, since);
     return json({
-      shop_id: workspace.id,
+      shop_id: shop.id,
       items: rows.map(r => ({
         id: r.id,
         to_phone: r.to_phone,
@@ -491,7 +672,7 @@ export async function deviceRoutes(ctx) {
         sent_at: r.sent_at,
         invoice_id: r.reference_id,          // legacy key kept for the phone app
         invoice_number: r.reference_number,
-        client_name: r.client_name || null
+        system_name: r.system_name || null
       }))
     });
   }
@@ -499,15 +680,15 @@ export async function deviceRoutes(ctx) {
   /* ---------------- email history (channel='email' jobs) --------------- */
   if (method === 'GET' && (path === 'device/emails' || path === 'device/emails/stats' || path.startsWith('device/emails/'))) {
     if (device.status !== 'active') return fail('Complete device setup before viewing email.', 403);
-    const visible = "workspace_id = ? AND channel = 'email'";
+    const visible = "shop_id = ? AND channel = 'email'";
 
     if (path === 'device/emails/stats') {
       const today = dayStart(url.searchParams.get('utcOffsetMinutes'));
       if (!today) return fail('Invalid UTC offset.', 400);
       const [todayRows, sentToday, latest] = await Promise.all([
-        all(env, `SELECT status, sent_at FROM cx_jobs WHERE ${visible} AND created_at >= ?`, workspace.id, today),
-        all(env, `SELECT id FROM cx_jobs WHERE ${visible} AND status = 'sent' AND sent_at >= ?`, workspace.id, today),
-        all(env, `SELECT * FROM cx_jobs WHERE ${visible} ORDER BY created_at DESC, id DESC LIMIT 1`, workspace.id)
+        all(env, `SELECT status, sent_at FROM cx_jobs WHERE ${visible} AND created_at >= ?`, shop.id, today),
+        all(env, `SELECT id FROM cx_jobs WHERE ${visible} AND status = 'sent' AND sent_at >= ?`, shop.id, today),
+        all(env, `SELECT * FROM cx_jobs WHERE ${visible} ORDER BY created_at DESC, id DESC LIMIT 1`, shop.id)
       ]);
       return json({
         sent: sentToday.length + todayRows.filter(r => r.status === 'sent' && !r.sent_at).length,
@@ -526,7 +707,7 @@ export async function deviceRoutes(ctx) {
         return fail('Invalid email history snapshot.', 400);
       const rows = await all(env,
         `SELECT * FROM cx_jobs WHERE ${visible} AND created_at <= ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`,
-        workspace.id, snapshot, EMAIL_PAGE_SIZE + 1, page * EMAIL_PAGE_SIZE);
+        shop.id, snapshot, EMAIL_PAGE_SIZE + 1, page * EMAIL_PAGE_SIZE);
       return json({
         items: rows.slice(0, EMAIL_PAGE_SIZE).map(r => publicEmail(r)),
         page,
@@ -537,8 +718,8 @@ export async function deviceRoutes(ctx) {
 
     const id = path.slice('device/emails/'.length);
     if (!isUuid(id)) return fail('Invalid email ID.', 400);
-    const message = await get(env, `SELECT * FROM cx_jobs WHERE ${visible} AND id = ?`, workspace.id, id);
-    if (!message) return fail('Email not found for this workspace.', 404);
+    const message = await get(env, `SELECT * FROM cx_jobs WHERE ${visible} AND id = ?`, shop.id, id);
+    if (!message) return fail('Email not found for this shop.', 404);
     return json(publicEmail(message, true));
   }
 
@@ -547,14 +728,14 @@ export async function deviceRoutes(ctx) {
 
 /* ---------- job row factory (shared with the client API) ---------- */
 export function smsJobRow({
-  workspaceId, clientId = null, apiKeyId = null, phone, name = null, recipientId = null,
+  shopId, systemId = null, apiKeyId = null, phone, name = null, recipientId = null,
   recipientType = 'customer', messageType = null, eventType = null, referenceId = null,
   referenceNumber = null, messageBody, idempotencyKey = null, maxAttempts = 3
 }) {
   return {
     id: uuid(),
-    workspace_id: workspaceId,
-    client_id: clientId,
+    shop_id: shopId,
+    system_id: systemId,
     api_key_id: apiKeyId,
     channel: 'sms',
     to_phone: phone,
@@ -574,4 +755,4 @@ export function smsJobRow({
   };
 }
 
-export { pairingCode, hashPassword, onlineOf };
+export { onlineOf };
