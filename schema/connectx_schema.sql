@@ -1,19 +1,19 @@
 -- =====================================================================
--- ConnectX Control — independent platform schema (Cloudflare D1 / SQLite)
+-- ConnectX Control  - independent platform schema (Cloudflare D1 / SQLite)
 -- =====================================================================
 -- ConnectX is a standalone communication-gateway platform:
 --
---   * SYSTEMS  (cx_systems)  — the allied products whose administrators
---     use the Android gateway (EMS today; InfluenceOS, CareOS, PlugX...).
---     Each system's API URL + auth paths are configured centrally here;
+--   * SYSTEMS  (cx_systems)   - the allied products whose administrators
+--     use the Android gateway (EMS today  - InfluenceOS, CareOS, PlugX...).
+--     Each system's API URL + auth paths are configured centrally here  -
 --     the Android app never stores or calls them directly.
---   * ADMINS   (cx_admins)   — administrators verified THROUGH a system
---     (federated login: app → ConnectX → system API). No passwords are
---     stored; only a short-lived system session token for shop re-sync.
---   * SHOPS    (cx_shops)    — the shops an administrator may connect a
+--   * ADMINS   (cx_admins)    - administrators verified THROUGH a system
+--     (federated login: app -> ConnectX -> system API). No passwords are
+--     stored  - only a short-lived system session token for shop re-sync.
+--   * SHOPS    (cx_shops)     - the shops an administrator may connect a
 --     gateway to, synced from the system (or provisioned manually).
---   * DEVICES  (cx_devices)  — paired Android gateway phones (per shop).
---   * JOBS     (cx_jobs)     — unified outbound messages (SMS + email).
+--   * DEVICES  (cx_devices)   - paired Android gateway phones (per shop).
+--   * JOBS     (cx_jobs)      - unified outbound messages (SMS + email).
 --
 -- Nothing here references another product's database. External products
 -- push work through cx_systems + cx_api_keys and receive webhook results.
@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS cx_operators (
 );
 
 -- Integrated systems (EMS, InfluenceOS, CareOS, PlugX, custom...).
--- The Android app shows active systems on its sign-in screen; ConnectX
+-- The Android app shows active systems on its sign-in screen  - ConnectX
 -- calls api_url/login_path to verify administrators and api_url/shops_path
 -- to list their shops. Defaults match the shared DoxTox API convention.
 CREATE TABLE IF NOT EXISTS cx_systems (
@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS cx_systems (
 
 -- Administrators of external systems, verified through federated login.
 -- system_token is the LIVE session token issued by that system (used to
--- re-sync shops); it expires and is then replaced by a fresh sign-in.
+-- re-sync shops)  - it expires and is then replaced by a fresh sign-in.
 CREATE TABLE IF NOT EXISTS cx_admins (
   id               TEXT PRIMARY KEY,
   system_id        TEXT NOT NULL,
@@ -126,7 +126,7 @@ CREATE TABLE IF NOT EXISTS cx_pairing_codes (
 );
 
 -- API keys handed to systems for the client API. Only the SHA-256 hash is
--- stored; the plain key is shown once at creation time.
+-- stored  - the plain key is shown once at creation time.
 CREATE TABLE IF NOT EXISTS cx_api_keys (
   id           TEXT PRIMARY KEY,
   system_id    TEXT NOT NULL,
@@ -219,8 +219,8 @@ CREATE TABLE IF NOT EXISTS cx_sim_carriers (
 );
 
 -- Key/value platform settings (JSON values).
---   'sms'   → global gateway toggle + message templates ({enabled, templates})
---   'email' → provider config for the email gateway (owner-only; the API
+--   'sms'   -> global gateway toggle + message templates ({enabled, templates})
+--   'email' -> provider config for the email gateway (owner-only  - the API
 --             key stored here is never returned by any GET endpoint)
 CREATE TABLE IF NOT EXISTS cx_settings (
   setting_key   TEXT PRIMARY KEY,

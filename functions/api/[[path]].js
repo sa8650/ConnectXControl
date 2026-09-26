@@ -52,12 +52,20 @@ export async function onRequest(context) {
     else if (path.startsWith('device/')) response = await deviceRoutes(ctx);
     else if (path.startsWith('client/')) response = await clientRoutes(ctx);
     else if (path.startsWith('public/')) response = await publicReleaseRoutes(ctx);
-    else if (path === '' || path === 'health') response = json({ ok: true, service: 'connectx-control', version: '2.0.0' });
+    else if (path === '' || path === 'health') response = json({ ok: true, service: 'connectx-control', version: '2.1.0' });
     else response = fail('Unknown ConnectX API endpoint.', 404);
 
     return withCors(response || fail('Unknown ConnectX API endpoint.', 404));
   } catch (error) {
     console.error('ConnectX API error:', path, error);
-    return withCors(fail('Internal ConnectX error: ' + String(error?.message || error), 500));
+    const msg = String(error?.message || error);
+    // Old 2.0 (workspace-era) tables still present: the new indexes/columns
+    // are missing. Give the operator the exact upgrade command instead of a
+    // raw SQLite error.
+    if (/no such column: (shop_id|system_id|admin_id|external_id)/.test(msg))
+      return withCors(fail('This ConnectX database still uses the old 2.0 (workspace) schema. Upgrade it once: npm run db:migrate:remote && npm run db:remote — see DEPLOY.md §3.', 503));
+    if (/no such table: cx_/.test(msg))
+      return withCors(fail('The ConnectX database schema is not installed yet. Apply it: npm run db:remote (upgrading from 2.0? run npm run db:migrate:remote first) — see DEPLOY.md §3.', 503));
+    return withCors(fail('Internal ConnectX error: ' + msg, 500));
   }
 }

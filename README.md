@@ -56,6 +56,8 @@ connectx-control/
 ```bash
 npm install
 npm run db:local                      # create local D1 tables
+# upgrading a local DB made with the old 2.0 (workspace) schema instead:
+#   npm run db:migrate:local && npm run db:local
 npm run pages:dev                     # backend + built SPA on http://localhost:8788
 # optional, in other terminals:
 node scripts/mock-ems.mjs             # demo "EMS-style" system API on :8799

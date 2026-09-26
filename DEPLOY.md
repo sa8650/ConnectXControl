@@ -45,11 +45,27 @@ Commit the updated `wrangler.toml` (with the real `database_id`) and push.
 
 ## 3. Apply the schema
 
+**Fresh database (normal case):**
+
 ```bash
 npx wrangler d1 execute connectx-control --remote --file=./schema/connectx_schema.sql
 ```
 
 All statements are `CREATE TABLE IF NOT EXISTS`, so re-running is safe.
+
+**Upgrading a database created with the old 2.0 (workspace) schema** — symptoms:
+`no such column: shop_id / system_id` or `incomplete input` while applying the schema.
+The workspace-era tables are incompatible and must be dropped first:
+
+```bash
+npm run db:migrate:remote   # drops cx_workspaces/cx_clients/cx_jobs/cx_devices/cx_pairing_codes/cx_api_keys
+npm run db:remote           # recreates everything in the 2.1 layout
+```
+
+Kept through the upgrade: owner/operator accounts, published releases, SIM carrier
+catalog, settings (incl. the stored email provider key) and the audit log. Dropped:
+old message history, paired devices, API keys and workspaces — re-pair phones and
+re-issue keys once after upgrading. (Local equivalents: `db:migrate:local`, `db:local`.)
 
 ---
 
