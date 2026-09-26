@@ -26,7 +26,7 @@ ConnectX Control is a complete, self-contained product:
 | Database | Cloudflare D1 (SQLite) — binding `DB` |
 | Release storage | Cloudflare R2 — binding `APP_STORAGE` (APK uploads) |
 | Auth | HMAC-SHA256 signed bearer sessions · PBKDF2 (100k) passwords · hashed device tokens & API keys · federated system logins (server-side) |
-| Tests | `node --test` over an in-memory SQLite D1 stub + a stubbed system API (44 tests) |
+| Tests | `node --test` over an in-memory SQLite D1 stub + a stubbed system API (48 tests) |
 
 ## Project layout
 
@@ -60,7 +60,7 @@ npm run pages:dev                     # backend + built SPA on http://localhost:
 # optional, in other terminals:
 node scripts/mock-ems.mjs             # demo "EMS-style" system API on :8799
 npm run dev                           # vite dev server on :5173 proxying /api → :8788
-npm test                              # 44 backend tests (in-memory SQLite)
+npm test                              # 48 backend tests (in-memory SQLite)
 node scripts/e2e.mjs                  # end-to-end smoke test (needs both servers above)
 ```
 
