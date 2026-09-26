@@ -20,7 +20,7 @@ export default function Dashboard() {
   if (error) return <Card title="Dashboard"><div className="form-error">{error}</div></Card>;
   if (!data) return <div className="center-screen"><Spinner /></div>;
 
-  const clients = Object.entries(data.byClient);
+  const systems = Object.entries(data.bySystem);
 
   return (
     <>
@@ -39,18 +39,18 @@ export default function Dashboard() {
       <div className="grid grid-4" style={{ marginBottom: 16 }}>
         <Stat label="Gateways online" value={`${data.devices.online}/${data.devices.total}`} tone={data.devices.online ? 'good' : 'warn'} hint="seen in last 3 minutes" />
         <Stat label="Pending test" value={data.devices.pendingTest} tone={data.devices.pendingTest ? 'warn' : 'default'} hint="awaiting first test SMS" />
-        <Stat label="Workspaces" value={data.workspaces.total} hint={`${data.workspaces.active} active`} />
-        <Stat label="Connected apps" value={data.clients.total} hint={`${data.clients.active} active`} />
+        <Stat label="Shops" value={data.shops.total} hint={`${data.shops.active} active`} />
+        <Stat label="Connected systems" value={data.systems.total} hint={`${data.systems.connected} with API URL`} />
       </div>
 
       <div className="grid grid-2">
-        <Card title="Traffic by app" subtitle="Today, per connected product (client API keys)">
-          {clients.length === 0
-            ? <Empty>No app traffic yet. Issue an API key under <Link to="/clients">Apps &amp; API Keys</Link>.</Empty>
+        <Card title="Traffic by system" subtitle="Today, per connected product (client API keys)">
+          {systems.length === 0
+            ? <Empty>No system traffic yet. Issue an API key under <Link to="/systems">Systems &amp; API Keys</Link>.</Empty>
             : <div className="table-wrap"><table className="table">
-                <thead><tr><th>App</th><th>Sent</th><th>Failed</th><th>Pending</th></tr></thead>
+                <thead><tr><th>System</th><th>Sent</th><th>Failed</th><th>Pending</th></tr></thead>
                 <tbody>
-                  {clients.map(([name, u]) => (
+                  {systems.map(([name, u]) => (
                     <tr key={name}>
                       <td className="td-main">{name}</td>
                       <td>{u.sent}</td>
@@ -65,19 +65,19 @@ export default function Dashboard() {
         <Card title="Quick actions">
           <div className="pill-row" style={{ flexDirection: 'column', alignItems: 'stretch', gap: 10 }}>
             <Link className="btn btn-soft" to="/devices">▣ Pair an Android gateway (generate pairing code)</Link>
-            <Link className="btn btn-soft" to="/clients">⚿ Issue an API key for EMS / CareOS / InfluenceOS / PlugX</Link>
+            <Link className="btn btn-soft" to="/systems">⚿ Configure systems & issue API keys (EMS / CareOS / InfluenceOS / PlugX)</Link>
             <Link className="btn btn-soft" to="/releases">↥ Publish a ConnectX app release (updates channel)</Link>
             <Link className="btn btn-soft" to="/jobs">≡ Inspect or cancel queued messages</Link>
           </div>
         </Card>
       </div>
 
-      <Card title="Recent messages" subtitle="Newest jobs across every app and gateway"
+      <Card title="Recent messages" subtitle="Newest jobs across every system, shop and gateway"
         actions={<Link className="btn btn-ghost btn-sm" to="/jobs">Open Messages →</Link>}>
         {data.recentJobs.length === 0
-          ? <Empty>No messages yet. They appear here as apps push jobs through the ConnectX client API.</Empty>
+          ? <Empty>No messages yet. They appear here as systems push jobs through the ConnectX client API.</Empty>
           : <div className="table-wrap"><table className="table">
-              <thead><tr><th>To</th><th>Type</th><th>App</th><th>Workspace</th><th>Status</th><th>Created</th></tr></thead>
+              <thead><tr><th>To</th><th>Type</th><th>System</th><th>Shop</th><th>Status</th><th>Created</th></tr></thead>
               <tbody>
                 {data.recentJobs.map(j => (
                   <tr key={j.id}>
@@ -89,8 +89,8 @@ export default function Dashboard() {
                       <div className="td-main">{j.message_type || j.channel.toUpperCase()}</div>
                       <div className="td-sub">{j.channel}</div>
                     </td>
-                    <td>{j.client_name}</td>
-                    <td>{j.workspace_name || '—'}</td>
+                    <td>{j.system_name}</td>
+                    <td>{j.shop_name || '—'}</td>
                     <td><Badge value={j.status} /></td>
                     <td className="td-sub" title={fmtDate(j.created_at)}>{timeAgo(j.created_at)}</td>
                   </tr>

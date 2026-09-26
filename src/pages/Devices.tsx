@@ -1,27 +1,27 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { api, Device, Workspace } from '../api/client';
+import { api, Device, Shop } from '../api/client';
 import {
-  Badge, Button, Card, CopyButton, Empty, Field, Input, Modal, PageHead,
+  Badge, Button, Card, CopyButton, Empty, Field, Modal, PageHead,
   Select, Spinner, fmtDate, timeAgo, toast
 } from '../components/ui';
 
 export default function Devices() {
   const [devices, setDevices] = useState<Device[] | null>(null);
-  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [shops, setShops] = useState<Shop[]>([]);
   const [pairOpen, setPairOpen] = useState(false);
-  const [pairWs, setPairWs] = useState('');
+  const [pairShop, setPairShop] = useState('');
   const [pairTtl, setPairTtl] = useState('60');
-  const [pairResult, setPairResult] = useState<{ code: string; ws: string; ttl: number } | null>(null);
+  const [pairResult, setPairResult] = useState<{ code: string; shop: string; ttl: number } | null>(null);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
 
   const load = useCallback(async () => {
     try {
-      const [d, w] = await Promise.all([
+      const [d, s] = await Promise.all([
         api.get<Device[]>('control/devices'),
-        api.get<Workspace[]>('control/workspaces')
+        api.get<Shop[]>('control/shops?status=active')
       ]);
-      setDevices(d); setWorkspaces(w.filter(x => x.status === 'active'));
+      setDevices(d); setShops(s);
       setError('');
     } catch (e: any) { setError(e?.message || 'Failed to load gateways.'); }
   }, []);
@@ -33,9 +33,9 @@ export default function Devices() {
     setBusy(true);
     try {
       const res = await api.post<{ code: string; expires_in_minutes: number }>('control/devices/pairing-code', {
-        workspace_id: pairWs, ttl_minutes: Number(pairTtl)
+        shop_id: pairShop, ttl_minutes: Number(pairTtl)
       });
-      setPairResult({ code: res.code, ws: workspaces.find(w => w.id === pairWs)?.name || '', ttl: res.expires_in_minutes });
+      setPairResult({ code: res.code, shop: shops.find(s => s.id === pairShop)?.name || '', ttl: res.expires_in_minutes });
       toast('Pairing code created');
     } catch (err: any) { toast(err?.message || 'Failed', 'err'); }
     finally { setBusy(false); }
@@ -58,9 +58,9 @@ export default function Devices() {
     <>
       <PageHead
         title="Android Gateways"
-        subtitle="Phones running the ConnectX gateway app. They pair with a workspace, claim queued SMS and dispatch them through their SIM."
+        subtitle="Phones running the ConnectX gateway app. They pair with a shop of a connected system, claim queued SMS and dispatch them through their SIM."
         actions={
-          <Button onClick={() => { setPairOpen(true); setPairResult(null); setPairWs(workspaces[0]?.id || ''); }}>
+          <Button onClick={() => { setPairOpen(true); setPairResult(null); setPairShop(shops[0]?.id || ''); }}>
             ＋ Pair new gateway
           </Button>
         }
@@ -69,15 +69,15 @@ export default function Devices() {
       <Card>
         {devices.length === 0 ? (
           <Empty>
-            No gateways yet. Create a pairing code, then open the ConnectX app on the phone,
-            enter this website's URL and the code.
+            No gateways yet. Create a pairing code, then open the ConnectX app on the phone and
+            enter the code — or sign in as a system administrator in the app and pick a shop.
           </Empty>
         ) : (
           <div className="table-wrap">
             <table className="table">
               <thead>
                 <tr>
-                  <th>Device</th><th>Workspace</th><th>SIM</th><th>Status</th>
+                  <th>Device</th><th>Shop</th><th>System</th><th>SIM</th><th>Status</th>
                   <th>Last seen</th><th>App</th><th></th>
                 </tr>
               </thead>
@@ -92,9 +92,10 @@ export default function Devices() {
                       <div className="td-sub mono">{d.device_public_id}</div>
                     </td>
                     <td>
-                      <div className="td-main">{d.workspace_name || '—'}</div>
-                      <div className="td-sub mono">{d.workspace_code}</div>
+                      <div className="td-main">{d.shop_name || '—'}</div>
+                      <div className="td-sub mono">{d.shop_external_id || ''}</div>
                     </td>
+                    <td className="td-sub">{d.system_name || '—'}</td>
                     <td>
                       <div className="td-main">{d.sim_carrier || '—'}</div>
                       <div className="td-sub mono">{d.phone_number || ''}</div>
@@ -131,14 +132,18 @@ export default function Devices() {
           {!pairResult ? (
             <form onSubmit={createPairing}>
               <div className="form-note">
-                On the phone: install the ConnectX app → enter this website's full URL → choose
-                “Pair with a code instead” → type the code below. Alternatively an operator
-                account can sign in on the phone and pick a workspace.
+                On the phone: open the ConnectX app → “Pair with a code instead” → type the code
+                below. The app connects to ConnectX automatically; no website URL or system
+                credentials are needed on the phone.
               </div>
-              <Field label="Workspace">
-                <Select value={pairWs} onChange={e => setPairWs(e.target.value)} required>
-                  {workspaces.length === 0 && <option value="">No active workspace — create one first</option>}
-                  {workspaces.map(w => <option key={w.id} value={w.id}>{w.name} ({w.code})</option>)}
+              <Field label="Shop" hint="The shop this gateway will deliver messages for. Shops sync automatically when a system administrator signs in on the phone.">
+                <Select value={pairShop} onChange={e => setPairShop(e.target.value)} required>
+                  {shops.length === 0 && <option value="">No active shops yet</option>}
+                  {shops.map(s => (
+                    <option key={s.id} value={s.id}>
+                      {s.name}{s.system_name ? ` — ${s.system_name}` : ''}
+                    </option>
+                  ))}
                 </Select>
               </Field>
               <Field label="Code validity" hint="How long the code stays usable.">
@@ -149,18 +154,18 @@ export default function Devices() {
                   <option value="1440">24 hours</option>
                 </Select>
               </Field>
-              <Button type="submit" disabled={busy || !pairWs}>{busy ? 'Creating…' : 'Generate pairing code'}</Button>
+              <Button type="submit" disabled={busy || !pairShop}>{busy ? 'Creating…' : 'Generate pairing code'}</Button>
             </form>
           ) : (
             <div>
-              <p className="muted">Share this code with the phone. Workspace: <strong>{pairResult.ws}</strong> · valid {pairResult.ttl} minutes.</p>
+              <p className="muted">Share this code with the phone. Shop: <strong>{pairResult.shop}</strong> · valid {pairResult.ttl} minutes.</p>
               <div className="pairing-code">{pairResult.code}</div>
               <div className="pill-row" style={{ justifyContent: 'center' }}>
                 <CopyButton value={pairResult.code} label="Copy code" />
-                <CopyButton value={`${window.location.origin}\n${pairResult.code}`} label="Copy URL + code" />
               </div>
               <p className="field-hint" style={{ marginTop: 14 }}>
-                The gateway website URL for the phone is: <span className="mono">{window.location.origin}</span>
+                The app already knows the ConnectX control address. Only if it cannot reach it will
+                the phone ask for a URL — then enter <span className="mono">{window.location.origin}</span>.
               </p>
               <div style={{ marginTop: 12 }}>
                 <Button variant="ghost" onClick={() => { setPairOpen(false); load(); }}>Done</Button>

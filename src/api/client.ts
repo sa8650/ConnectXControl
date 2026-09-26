@@ -50,23 +50,43 @@ export interface Operator {
   admin_code?: string | null; active: boolean; created_at?: string | null;
   role?: 'owner' | 'operator'; operator_code?: string; last_login_at?: string | null;
 }
-export interface Workspace {
-  id: string; name: string; code: string; address: string; phone: string;
-  status?: 'active' | 'paused'; devices?: number; online?: number; created_at?: string;
+
+/** An external product ConnectX integrates with (EMS, InfluenceOS, CareOS, PlugX…). */
+export interface SystemInfo {
+  id: string; system_key: string; name: string; description: string;
+  api_url: string; login_path: string; shops_path: string;
+  webhook_url: string | null; status: 'active' | 'disabled';
+  configured: boolean; shops: number; devices: number; created_at: string;
+  usage30d?: { sent: number; failed: number; pending: number; cancelled: number };
+  keys?: ApiKeyInfo[];
 }
+
+/** A shop/branch inside an external system. Devices pair to a shop; jobs belong to a shop. */
+export interface Shop {
+  id: string; system_id: string; external_id: string; name: string;
+  shop_code: string; address: string; phone: string; category: string;
+  status: 'active' | 'paused'; system_status: string;
+  system_name?: string | null; system_key?: string | null;
+  devices?: number; online?: number;
+  created_at?: string; updated_at?: string;
+}
+
 export interface Device {
   id: string; device_public_id: string; device_name: string | null;
   android_version: string | null; app_version?: string | null;
   sim_subscription_id: string | null; sim_carrier: string | null; phone_number: string | null;
   status: 'pending_test' | 'active' | 'revoked'; is_primary: boolean;
   last_seen: string | null; created_at: string;
-  workspace_id: string; workspace_name?: string | null; workspace_code?: string | null;
+  shop_id: string; shop_name?: string | null; shop_external_id?: string | null;
+  system_name?: string | null; system_key?: string | null;
   online?: boolean;
 }
+
 export interface Job {
   id: string; channel: 'sms' | 'email'; status: string;
-  workspace_id: string; workspace_name?: string | null; workspace_code?: string | null;
-  client_id?: string | null; client_name?: string | null; client_key?: string | null;
+  shop_id: string; shop_name?: string | null; shop_external_id?: string | null;
+  system_id?: string | null; system_name?: string | null; system_key?: string | null;
+  to?: string | null;
   to_phone?: string | null; to_emails?: string[] | null; subject?: string | null;
   recipient_name?: string | null; message_type?: string | null; event_type?: string | null;
   reference_id?: string | null; reference_number?: string | null; message_body?: string | null;
@@ -74,18 +94,13 @@ export interface Job {
   attempts: number; max_attempts: number; error_message?: string | null;
   created_at: string; sent_at?: string | null; claimed_at?: string | null;
 }
+
 export interface ApiKeyInfo {
-  id: string; label: string; key_prefix: string; workspace_id: string | null;
-  workspace?: { id: string; name: string; code: string } | null;
+  id: string; label: string; key_prefix: string;
   daily_limit: number; status: 'active' | 'revoked';
   last_used_at: string | null; created_at: string;
 }
-export interface Client {
-  id: string; client_key: string; name: string; description: string;
-  webhook_url: string | null; status: 'active' | 'disabled'; created_at: string;
-  usage30d?: { sent: number; failed: number; pending: number; cancelled: number };
-  keys?: ApiKeyInfo[];
-}
+
 export interface Release {
   id: string; package_name: string; title: string; description: string;
   version: string; version_code: number; mandatory: boolean; release_notes: string;
@@ -93,24 +108,27 @@ export interface Release {
   published: boolean; download_available?: boolean; download_url?: string;
   created_at?: string; updated_at?: string;
 }
+
 export interface Carrier {
   id: string; carrier_name: string; carrier_identifier?: string | null;
   mcc_mnc?: string | null; balance_ussd_code?: string | null;
   balance_pattern?: string | null; active: number | boolean;
 }
+
 export interface ActivityItem {
   id: string; actor_type: string; actor_label?: string | null; action: string;
   entity_type?: string | null; entity_id?: string | null; meta?: unknown; created_at: string;
 }
+
 export interface Dashboard {
   today: { smsSent: number; smsFailed: number; smsPending: number; emailSent: number; emailFailed: number; emailPending: number };
   devices: { total: number; online: number; pendingTest: number };
-  workspaces: { total: number; active: number };
-  clients: { total: number; active: number };
-  byClient: Record<string, { sent: number; failed: number; pending: number }>;
+  shops: { total: number; active: number };
+  systems: { total: number; active: number; connected: number };
+  bySystem: Record<string, { sent: number; failed: number; pending: number }>;
   recentJobs: Array<{
     id: string; channel: string; status: string; to: string; recipient_name: string | null;
-    message_type: string | null; client_name: string; workspace_name: string | null;
-    workspace_code: string | null; created_at: string; sent_at: string | null;
+    message_type: string | null; system_name: string; shop_name: string | null;
+    shop_external_id: string | null; created_at: string; sent_at: string | null;
   }>;
 }

@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { api, Job, Workspace, Client } from '../api/client';
+import { api, Job, Shop, SystemInfo } from '../api/client';
 import {
   Badge, Button, Card, Empty, Field, Input, Modal, PageHead, Select,
   Spinner, TextArea, fmtDate, timeAgo, toast
@@ -11,17 +11,17 @@ export default function Jobs() {
   const [items, setItems] = useState<Job[]>([]);
   const [hasMore, setHasMore] = useState(false);
   const [offset, setOffset] = useState(0);
-  const [filters, setFilters] = useState({ channel: '', status: '', workspace_id: '', client_id: '', search: '' });
-  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
-  const [clients, setClients] = useState<Client[]>([]);
+  const [filters, setFilters] = useState({ channel: '', status: '', shop_id: '', system_id: '', search: '' });
+  const [shops, setShops] = useState<Shop[]>([]);
+  const [systems, setSystems] = useState<SystemInfo[]>([]);
   const [detail, setDetail] = useState<Job | null>(null);
   const [sendOpen, setSendOpen] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
   useEffect(() => {
-    api.get<Workspace[]>('control/workspaces').then(setWorkspaces).catch(() => {});
-    api.get<Client[]>('control/clients').then(setClients).catch(() => {});
+    api.get<Shop[]>('control/shops').then(setShops).catch(() => {});
+    api.get<SystemInfo[]>('control/systems').then(setSystems).catch(() => {});
   }, []);
 
   const load = useCallback(async (off = 0) => {
@@ -50,7 +50,7 @@ export default function Jobs() {
     <>
       <PageHead
         title="Messages"
-        subtitle="Every SMS job and email record flowing through ConnectX — from any connected app or the console."
+        subtitle="Every SMS job and email record flowing through ConnectX — from any connected system or the console."
         actions={
           <>
             <Button variant="ghost" onClick={() => load(offset)}>↻ Refresh</Button>
@@ -72,25 +72,25 @@ export default function Jobs() {
             <option value="">Any status</option>
             {['queued', 'sending', 'sent', 'failed', 'cancelled'].map(s => <option key={s} value={s}>{s}</option>)}
           </Select>
-          <Select value={filters.workspace_id} onChange={e => setFilters({ ...filters, workspace_id: e.target.value })}>
-            <option value="">All workspaces</option>
-            {workspaces.map(w => <option key={w.id} value={w.id}>{w.name}</option>)}
+          <Select value={filters.shop_id} onChange={e => setFilters({ ...filters, shop_id: e.target.value })}>
+            <option value="">All shops</option>
+            {shops.map(w => <option key={w.id} value={w.id}>{w.name}{w.system_name ? ` — ${w.system_name}` : ''}</option>)}
           </Select>
-          <Select value={filters.client_id} onChange={e => setFilters({ ...filters, client_id: e.target.value })}>
-            <option value="">All apps</option>
-            {clients.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+          <Select value={filters.system_id} onChange={e => setFilters({ ...filters, system_id: e.target.value })}>
+            <option value="">All systems</option>
+            {systems.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
           </Select>
         </div>
 
         {error && <div className="form-error">{error}</div>}
         {loading ? <div className="empty"><Spinner /></div> : items.length === 0 ? (
-          <Empty>No messages match. Apps push jobs via the client API (see API Docs); you can also send a test SMS here.</Empty>
+          <Empty>No messages match. Systems push jobs via the client API (see API Docs); you can also send a test SMS here.</Empty>
         ) : (
           <>
             <div className="table-wrap">
               <table className="table">
                 <thead>
-                  <tr><th>To</th><th>Type</th><th>App</th><th>Workspace</th><th>Gateway</th><th>Status</th><th>Created</th><th></th></tr>
+                  <tr><th>To</th><th>Type</th><th>System</th><th>Shop</th><th>Gateway</th><th>Status</th><th>Created</th><th></th></tr>
                 </thead>
                 <tbody>
                   {items.map(j => (
@@ -103,8 +103,8 @@ export default function Jobs() {
                         <div className="td-main">{j.message_type || j.channel.toUpperCase()}</div>
                         <div className="td-sub">{j.channel}{j.reference_number ? ` · ${j.reference_number}` : ''}</div>
                       </td>
-                      <td>{j.client_name || <span className="td-sub">console/device</span>}</td>
-                      <td>{j.workspace_name || '—'}</td>
+                      <td>{j.system_name || <span className="td-sub">console/device</span>}</td>
+                      <td>{j.shop_name || '—'}</td>
                       <td className="td-sub">{j.device_name || '—'}</td>
                       <td><Badge value={j.status} /></td>
                       <td className="td-sub" title={fmtDate(j.created_at)}>{timeAgo(j.created_at)}</td>
@@ -129,7 +129,7 @@ export default function Jobs() {
       </Card>
 
       {detail && <JobDetail job={detail} onClose={() => setDetail(null)} onCancel={() => act(detail, 'cancel')} onRetry={() => act(detail, 'retry')} />}
-      {sendOpen && <SendTest onClose={() => setSendOpen(false)} onSent={() => { setSendOpen(false); load(0); }} workspaces={workspaces} />}
+      {sendOpen && <SendTest onClose={() => setSendOpen(false)} onSent={() => { setSendOpen(false); load(0); }} shops={shops} />}
     </>
   );
 }
@@ -141,8 +141,8 @@ function JobDetail({ job, onClose, onCancel, onRetry }: { job: Job; onClose: () 
         <dt>Status</dt><dd><Badge value={job.status} /></dd>
         <dt>Job ID</dt><dd className="mono">{job.id}</dd>
         <dt>Channel</dt><dd>{job.channel}</dd>
-        <dt>App</dt><dd>{job.client_name || 'console/device'}</dd>
-        <dt>Workspace</dt><dd>{job.workspace_name || '—'} <span className="mono muted">({job.workspace_code})</span></dd>
+        <dt>System</dt><dd>{job.system_name || 'console/device'}</dd>
+        <dt>Shop</dt><dd>{job.shop_name || '—'}{job.shop_external_id ? <span className="mono muted"> ({job.shop_external_id})</span> : null}</dd>
         {job.channel === 'sms' && <><dt>To phone</dt><dd className="mono">{job.to_phone}</dd></>}
         {job.channel === 'email' && <>
           <dt>To</dt><dd>{(job.to_emails || []).join(', ')}</dd>
@@ -166,20 +166,20 @@ function JobDetail({ job, onClose, onCancel, onRetry }: { job: Job; onClose: () 
   );
 }
 
-function SendTest({ onClose, onSent, workspaces }: { onClose: () => void; onSent: () => void; workspaces: Workspace[] }) {
-  const [ws, setWs] = useState(workspaces.find(w => w.status === 'active')?.id || '');
+function SendTest({ onClose, onSent, shops }: { onClose: () => void; onSent: () => void; shops: Shop[] }) {
+  const [ws, setWs] = useState(shops.find(w => w.status === 'active')?.id || '');
   const [to, setTo] = useState('');
   const [name, setName] = useState('');
   const [message, setMessage] = useState('ConnectX test message from the control website.');
   const [busy, setBusy] = useState(false);
 
-  useEffect(() => { if (!ws) setWs(workspaces.find(w => w.status === 'active')?.id || ''); }, [workspaces, ws]);
+  useEffect(() => { if (!ws) setWs(shops.find(w => w.status === 'active')?.id || ''); }, [shops, ws]);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     setBusy(true);
     try {
-      await api.post('control/jobs', { workspace_id: ws, to, recipient_name: name, message, message_type: 'TEST' });
+      await api.post('control/jobs', { shop_id: ws, to, recipient_name: name, message, message_type: 'TEST' });
       toast('Test SMS queued — an online gateway will dispatch it');
       onSent();
     } catch (err: any) { toast(err?.message || 'Failed', 'err'); }
@@ -189,9 +189,9 @@ function SendTest({ onClose, onSent, workspaces }: { onClose: () => void; onSent
   return (
     <Modal title="Send a test SMS" onClose={onClose}>
       <form onSubmit={submit}>
-        <Field label="Workspace">
+        <Field label="Shop" hint="The shop whose gateway will deliver this test message.">
           <Select value={ws} onChange={e => setWs(e.target.value)} required>
-            {workspaces.filter(w => w.status === 'active').map(w => <option key={w.id} value={w.id}>{w.name} ({w.code})</option>)}
+            {shops.filter(w => w.status === 'active').map(w => <option key={w.id} value={w.id}>{w.name}{w.system_name ? ` — ${w.system_name}` : ''}</option>)}
           </Select>
         </Field>
         <div className="form-row">

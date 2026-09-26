@@ -7,8 +7,8 @@ import Login from './pages/Login';
 import Dashboard from './pages/Dashboard';
 import Devices from './pages/Devices';
 import Jobs from './pages/Jobs';
-import Workspaces from './pages/Workspaces';
-import Clients from './pages/Clients';
+import Shops from './pages/Shops';
+import Systems from './pages/Systems';
 import Releases from './pages/Releases';
 import Carriers from './pages/Carriers';
 import ApiDocs from './pages/ApiDocs';
@@ -35,8 +35,10 @@ export default function App() {
         <Route path="/" element={<Protected><Dashboard /></Protected>} />
         <Route path="/devices" element={<Protected><Devices /></Protected>} />
         <Route path="/jobs" element={<Protected><Jobs /></Protected>} />
-        <Route path="/workspaces" element={<Protected><Workspaces /></Protected>} />
-        <Route path="/clients" element={<Protected><Clients /></Protected>} />
+        <Route path="/shops" element={<Protected><Shops /></Protected>} />
+        <Route path="/systems" element={<Protected><Systems /></Protected>} />
+        <Route path="/workspaces" element={<Navigate to="/shops" replace />} />
+        <Route path="/clients" element={<Navigate to="/systems" replace />} />
         <Route path="/releases" element={<Protected><Releases /></Protected>} />
         <Route path="/carriers" element={<Protected><Carriers /></Protected>} />
         <Route path="/api-docs" element={<Protected><ApiDocs /></Protected>} />
