@@ -6,13 +6,15 @@ ConnectX Control is a complete, self-contained product:
 
 - 🖥️ **React control website** — manage Android gateway phones, workspaces, message jobs, connected apps, API keys, SIM carriers and app releases.
 - ⚙️ **Gateway API** — the only backend the ConnectX Android app talks to (pairing, job claim/report, stats, email history, OTA updates).
-- 🔌 **Client API (v1)** — how other products (**EMS, CareOS, InfluenceOS, PlugX**, anything future) push SMS/email jobs with an API key and get webhook callbacks.
+- 🔌 **Client API (v1)** — how other products (**EMS, CareOS, InfluenceOS, PlugX**, anything future) send SMS/email with an API key and get webhook callbacks. EMS-compatible field names and response shapes.
+- ✉️ **Email gateway** — configure Brevo (or Resend / SendGrid / Mailgun / Postmark) once in Settings; every connected app sends email through `POST /api/client/v1/email/send` and never needs its own SMTP setup. Sent mail is recorded for the website and the gateway phones.
 - 🗄️ **Own database** — Cloudflare D1 (`schema/connectx_schema.sql`). No shared tables, no shared sessions with any other product.
 
 > **Relationship to EMS:** none at runtime. EMS is not modified and not required. When you
 > are ready, EMS (or any product) simply becomes a *client*: issue it an API key here and
-> call `POST /api/client/v1/sms`. The Android gateway no longer knows or cares where a job
-> originated — every job is just workspace-scoped work with a `client_key` label.
+> call `POST /api/client/v1/sms` (SMS) and `POST /api/client/v1/email/send` (email). The
+> Android gateway no longer knows or cares where a job originated — every job is just
+> workspace-scoped work with a `client_key` label.
 
 ## Stack
 

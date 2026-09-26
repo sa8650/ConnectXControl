@@ -178,6 +178,9 @@ CREATE TABLE IF NOT EXISTS cx_sim_carriers (
 );
 
 -- Key/value platform settings (JSON values).
+--   'sms'   → per-workspace gateway toggles + message templates
+--   'email' → provider config for the email gateway (owner-only; the API
+--             key stored here is never returned by any GET endpoint)
 CREATE TABLE IF NOT EXISTS cx_settings (
   setting_key   TEXT PRIMARY KEY,
   setting_value TEXT,

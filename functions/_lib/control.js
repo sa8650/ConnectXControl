@@ -13,6 +13,7 @@ import {
 import { logActivity, recentActivity } from './audit.js';
 import { publicOperator, publicWorkspace, publicDevice, smsJobRow } from './device.js';
 import { apkKey, getReleaseBucket, releaseStatus, downloadPath } from './releases.js';
+import { emailConfig, providerList, sendEmail } from './email.js';
 
 const CONTROL_TTL = 60 * 60 * 12; // 12h control-panel sessions
 const SEED_CLIENTS = [
@@ -605,7 +606,9 @@ export async function controlRoutes(ctx) {
   if (path === 'control/settings' && method === 'GET') {
     const rows = await all(env, 'SELECT * FROM cx_settings');
     const out = {};
-    for (const r of rows) out[r.setting_key] = parseJson(r.setting_value, null);
+    // The email provider config (incl. its API key) is owner-only and served
+    // masked by GET control/email — never leak it through generic settings.
+    for (const r of rows) if (r.setting_key !== 'email') out[r.setting_key] = parseJson(r.setting_value, null);
     out.sms ||= {};
     // merge default templates per workspace for display
     return json({ ...out, defaultTemplates: DEFAULT_TEMPLATES });
@@ -613,16 +616,86 @@ export async function controlRoutes(ctx) {
   if (path === 'control/settings' && method === 'PATCH') {
     const b = await body();
     for (const key of Object.keys(b)) {
-      if (!['sms', 'branding', 'limits'].includes(key)) continue;
+      if (key !== 'sms') continue;
       const existing = await get(env, 'SELECT * FROM cx_settings WHERE setting_key = ?', key);
-      const merged = key === 'sms'
-        ? { ...(parseJson(existing?.setting_value, {}) || {}), ...b[key] }
-        : b[key];
+      const merged = { ...(parseJson(existing?.setting_value, {}) || {}), ...b[key] };
       if (existing) await update(env, 'cx_settings', { setting_value: JSON.stringify(merged), updated_at: nowIso() }, 'setting_key = ?', key);
       else await insert(env, 'cx_settings', { setting_key: key, setting_value: JSON.stringify(merged), updated_at: nowIso() });
     }
-    await auditOp(env, op, 'update settings', 'settings', null, { keys: Object.keys(b) });
+    await auditOp(env, op, 'update settings', 'settings', null, { keys: Object.keys(b).filter(k => k === 'sms') });
     return json({ ok: true });
+  }
+
+  /* ---------------- email gateway (owner only) -------------------------- */
+  if (path === 'control/email' && method === 'GET') {
+    if (!ownerOnly(op)) return fail('Only the owner can manage email sending.', 403);
+    const cfg = await emailConfig(env);
+    return json({
+      provider: cfg.provider,
+      providers: providerList(env),
+      from_name: cfg.fromName,
+      from_email: cfg.fromEmail,
+      reply_to: cfg.replyTo,
+      enabled: cfg.enabled,
+      daily_limit: cfg.dailyLimit,
+      mailgun_domain: cfg.mailgunDomain,
+      api_key_set: !!cfg.apiKey,
+      key_source: cfg.keySource           // 'environment' | 'database' | null
+    });
+  }
+  if (path === 'control/email' && method === 'PATCH') {
+    if (!ownerOnly(op)) return fail('Only the owner can manage email sending.', 403);
+    const b = await body();
+    const existing = await get(env, "SELECT * FROM cx_settings WHERE setting_key = 'email'");
+    const current = parseJson(existing?.setting_value, {}) || {};
+    const next = { ...current };
+    if (b.provider !== undefined) {
+      const p = str(b.provider, 20).toLowerCase();
+      if (!['brevo', 'resend', 'sendgrid', 'mailgun', 'postmark'].includes(p))
+        return fail('Unknown provider. Use brevo, resend, sendgrid, mailgun or postmark.', 400);
+      next.provider = p;
+    }
+    // An empty/blank api_key keeps the stored one; any other value replaces it.
+    if (b.api_key !== undefined && String(b.api_key).trim()) next.api_key = String(b.api_key).trim().slice(0, 300);
+    if (b.from_name !== undefined) next.from_name = str(b.from_name, 160);
+    if (b.from_email !== undefined) {
+      const fe = str(b.from_email, 320).trim();
+      if (fe && !isEmail(fe)) return fail('From Email must be a valid email address.', 400);
+      next.from_email = fe;
+    }
+    if (b.reply_to !== undefined) {
+      const rt = str(b.reply_to, 320).trim();
+      if (rt && !isEmail(rt)) return fail('Reply-To must be a valid email address.', 400);
+      next.reply_to = rt;
+    }
+    if (b.enabled !== undefined) next.enabled = !!b.enabled;
+    if (b.daily_limit !== undefined) next.daily_limit = Math.max(0, Math.min(100000, Number(b.daily_limit) || 0));
+    if (b.mailgun_domain !== undefined) next.mailgun_domain = str(b.mailgun_domain, 200).trim();
+    if (existing) await update(env, 'cx_settings', { setting_value: JSON.stringify(next), updated_at: nowIso() }, "setting_key = 'email'");
+    else await insert(env, 'cx_settings', { setting_key: 'email', setting_value: JSON.stringify(next), updated_at: nowIso() });
+    await auditOp(env, op, 'update email settings', 'settings', null,
+      { provider: next.provider, from_email: next.from_email, enabled: next.enabled, api_key_changed: !!(b.api_key && String(b.api_key).trim()) });
+    const cfg = await emailConfig(env);
+    return json({ ok: true, api_key_set: !!cfg.apiKey, key_source: cfg.keySource });
+  }
+  if (path === 'control/email/test' && method === 'POST') {
+    if (!ownerOnly(op)) return fail('Only the owner can manage email sending.', 403);
+    const b = await body();
+    const to = str(b.to || '', 320).trim();
+    if (!to || !isEmail(to)) return fail('Enter one valid test recipient email.', 400);
+    const cfg = await emailConfig(env);
+    if (!cfg.fromEmail) return fail('Save a valid From Email first.', 400);
+    if (!cfg.apiKey) return fail('No provider API key is set. Paste one here or set the ' +
+      (providerList(env).find(p => p.id === cfg.provider)?.envKey || 'provider') + ' environment secret.', 503);
+    const result = await sendEmail(env, cfg, {
+      to: [to], cc: [], bcc: [],
+      subject: 'ConnectX Provider Test',
+      html: '<div style="font-family:Arial,sans-serif;color:#172033;line-height:1.6"><h2 style="margin:0 0 8px">✓ ConnectX email works</h2><p style="color:#555">Your ' + cfg.provider + ' provider accepted this test email. Connected apps can now send email through <span style="font-family:monospace">POST /api/client/v1/email/send</span>.</p></div>',
+      fromName: cfg.fromName || 'ConnectX'
+    });
+    if (!result.ok) return fail(result.error, 502);
+    await auditOp(env, op, 'send email provider test', 'settings', null, { to, provider: cfg.provider });
+    return json({ ok: true, messageId: result.messageId || null, mocked: !!result.mocked });
   }
 
   /* ---------------- operators (owner only) ---------------------------- */

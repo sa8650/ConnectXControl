@@ -75,6 +75,8 @@ npx wrangler pages deploy dist --project-name=connectx-control
 | Secret text | `SESSION_SECRET` | long random string (see below) |
 | Plain text | `DEFAULT_DAILY_LIMIT` | `1000` (optional) |
 | Secret text | `WEBHOOK_SIGNING_SECRET` | optional, signs client webhooks |
+| Secret text | `BREVO_API_KEY` | optional — email provider key as an environment secret instead of storing it in Settings → Email (env wins over DB). Equivalent: `RESEND_API_KEY`, `SENDGRID_API_KEY`, `MAILGUN_API_KEY` (+ plain `MAILGUN_DOMAIN`), `POSTMARK_SERVER_TOKEN` |
+| Plain text | `MOCK_EMAIL` | `1` = simulate email delivery without calling the provider (local demos/tests only — never set in production) |
 
 Generate a secret:
 

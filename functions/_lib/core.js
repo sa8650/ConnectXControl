@@ -7,7 +7,7 @@
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
-export const PBKDF2_ITERATIONS = 100000; // Workers WebCrypto maximum
+const PBKDF2_ITERATIONS = 100000; // Workers WebCrypto maximum
 
 /* ---------- responses ---------- */
 export const json = (data, status = 200) => new Response(JSON.stringify(data), {
@@ -17,7 +17,7 @@ export const json = (data, status = 200) => new Response(JSON.stringify(data), {
 export const fail = (message, status = 400) => json({ error: message }, status);
 
 /* ---------- base64url / hex ---------- */
-export function b64u(bytes) {
+function b64u(bytes) {
   const bin = bytes instanceof Uint8Array ? bytes
     : bytes instanceof ArrayBuffer ? new Uint8Array(bytes)
     : enc.encode(bytes);
@@ -25,7 +25,7 @@ export function b64u(bytes) {
   for (const b of bin) s += String.fromCharCode(b);
   return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
-export function unb64u(str) {
+function unb64u(str) {
   const pad = str.length % 4 ? '='.repeat(4 - (str.length % 4)) : '';
   const bin = atob(str.replace(/-/g, '+').replace(/_/g, '/') + pad);
   const out = new Uint8Array(bin.length);

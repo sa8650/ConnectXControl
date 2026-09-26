@@ -22,8 +22,15 @@ import {
 } from './core.js';
 import { logActivity } from './audit.js';
 import { smsJobRow } from './device.js';
+import { emailConfig, sendEmail, plainTextHtml } from './email.js';
 
 const MAX_BULK = 100;
+
+/** First defined, non-empty value among aliases (snake_case + EMS-style camelCase). */
+function pick(b, ...names) {
+  for (const n of names) if (b[n] !== undefined && b[n] !== null && b[n] !== '') return b[n];
+  return undefined;
+}
 
 async function authenticate(env, request) {
   const header = request.headers.get('x-connectx-key') || '';
@@ -80,10 +87,13 @@ async function settingsFor(env, workspaceId) {
 
 function emailJobRow({ workspaceId, clientId, apiKeyId, b }) {
   const addresses = v => JSON.stringify(Array.isArray(v) ? v.map(x => str(x, 320)).filter(Boolean) : []);
-  const to = Array.isArray(b.to_emails || b.to) ? (b.to_emails || b.to) : str(b.to_emails || b.to || '').split(',');
-  const toList = to.map(x => str(x, 320)).filter(x => x && isEmail(x));
+  const rawTo = pick(b, 'to_emails', 'toEmails', 'to');
+  const to = Array.isArray(rawTo) ? rawTo : str(rawTo || '').split(',');
+  const toList = to.map(x => str(x, 320).trim()).filter(x => x && isEmail(x));
   if (!toList.length) return { error: fail('At least one valid recipient email is required.', 400) };
   const status = ['queued', 'sending', 'sent', 'failed'].includes(b.status) ? b.status : 'sent';
+  const rawCc = pick(b, 'cc_emails', 'ccEmails', 'cc');
+  const rawBcc = pick(b, 'bcc_emails', 'bccEmails', 'bcc');
   return {
     row: {
       id: uuid(),
@@ -91,27 +101,27 @@ function emailJobRow({ workspaceId, clientId, apiKeyId, b }) {
       client_id: clientId,
       api_key_id: apiKeyId,
       channel: 'email',
-      from_email: str(b.from_email || '', 320),
+      from_email: str(pick(b, 'from_email', 'fromEmail') || '', 320),
       to_emails: addresses(toList),
-      cc_emails: addresses(Array.isArray(b.cc_emails) ? b.cc_emails : str(b.cc_emails || '').split(',')),
-      bcc_emails: addresses(Array.isArray(b.bcc_emails) ? b.bcc_emails : []),
+      cc_emails: addresses(Array.isArray(rawCc) ? rawCc : str(rawCc || '').split(',')),
+      bcc_emails: addresses(Array.isArray(rawBcc) ? rawBcc : str(rawBcc || '').split(',')),
       subject: str(b.subject || '(No subject)', 500),
-      body_html: str(b.body_html || b.html || '', 200000),
-      custom_body: str(b.custom_body || b.body || '', 100000),
-      recipient_type: str(b.recipient_type || 'customer', 40),
-      recipient_id: str(b.recipient_id || '', 80) || null,
-      recipient_name: str(b.recipient_name || '', 160) || null,
-      message_type: str(b.message_type || 'EMAIL', 80),
-      event_type: str(b.event_type || '', 80) || null,
-      reference_id: str(b.reference_id || '', 80) || null,
-      reference_number: str(b.reference_number || '', 80) || null,
+      body_html: str(pick(b, 'body_html', 'bodyHtml', 'html') || '', 200000),
+      custom_body: str(pick(b, 'custom_body', 'customBody', 'body', 'text') || '', 100000),
+      recipient_type: str(pick(b, 'recipient_type', 'recipientType') || 'customer', 40),
+      recipient_id: str(pick(b, 'recipient_id', 'recipientId') || '', 80) || null,
+      recipient_name: str(pick(b, 'recipient_name', 'recipientName', 'name') || '', 160) || null,
+      message_type: str(pick(b, 'message_type', 'messageType') || 'EMAIL', 80),
+      event_type: str(pick(b, 'event_type', 'eventType') || '', 80) || null,
+      reference_id: str(pick(b, 'reference_id', 'referenceId', 'invoice_id', 'invoiceId') || '', 80) || null,
+      reference_number: str(pick(b, 'reference_number', 'referenceNumber', 'invoice_number', 'invoiceNumber') || '', 80) || null,
       status,
       attempts: status === 'sent' || status === 'failed' ? 1 : 0,
-      idempotency_key: str(b.idempotency_key || '', 160) || null,
-      error_message: str(b.error_message || '', 400) || null,
-      provider_message_id: str(b.provider_message_id || '', 160) || null,
+      idempotency_key: str(pick(b, 'idempotency_key', 'idempotencyKey') || '', 160) || null,
+      error_message: str(pick(b, 'error_message', 'errorMessage') || '', 400) || null,
+      provider_message_id: str(pick(b, 'provider_message_id', 'providerMessageId') || '', 160) || null,
       created_at: nowIso(),
-      sent_at: status === 'sent' ? (b.sent_at ? str(b.sent_at, 40) : nowIso()) : null
+      sent_at: status === 'sent' ? (pick(b, 'sent_at', 'sentAt') ? str(pick(b, 'sent_at', 'sentAt'), 40) : nowIso()) : null
     }
   };
 }
@@ -141,52 +151,71 @@ export async function clientRoutes(ctx) {
   }
 
   /* ---------------- send SMS (single) ---------------------------------- */
-  if (path === 'client/v1/sms' && method === 'POST') {
+  /* Accepts snake_case and EMS-style camelCase field names interchangeably:
+     to/toPhone/phone, message/messageBody, recipientName, messageType,
+     invoiceId/invoiceNumber, idempotencyKey, ...  (/sms/send is an alias
+     of /sms so EMS-style call sites can keep their path.) */
+  if ((path === 'client/v1/sms' || path === 'client/v1/sms/send') && method === 'POST') {
     const b = await body();
-    const ws = await resolveWorkspace(env, key, b.workspace || b.workspace_code);
+    const ws = await resolveWorkspace(env, key, pick(b, 'workspace', 'workspace_code', 'workspaceCode'));
     if (ws.error) return ws.error;
     const workspace = ws.workspace;
     if (workspace.status !== 'active') return fail('That workspace is paused in ConnectX Control.', 403);
     const settings = await settingsFor(env, workspace.id);
     if (!settings.enabled) return fail('SMS gateway is disabled for that workspace in ConnectX Control.', 403);
 
-    const phone = cleanPhone(b.to || b.phone || b.to_phone);
+    const phone = cleanPhone(pick(b, 'to', 'toPhone', 'to_phone', 'phone'));
     if (!phone) return fail('A valid destination phone number is required.', 400);
 
     // Typed events (SALE, PAYMENT, ...) can be rendered from workspace templates
     // when the caller does not supply a message body.
-    let messageBody = str(b.message || b.message_body || '', 1600);
-    const eventType = str(b.event_type || b.messageType || b.message_type || '', 80).toUpperCase() || null;
+    let messageBody = str(pick(b, 'message', 'message_body', 'messageBody') || '', 1600);
+    const eventType = str(pick(b, 'event_type', 'eventType', 'messageType', 'message_type') || '', 80).toUpperCase() || null;
     if (!messageBody && eventType && settings.templates[eventType]) {
       messageBody = fillTemplate(settings.templates[eventType],
         templateVars(workspace.name, {
-          name: b.recipient_name || b.name, invoice: b.reference_number || b.reference_id,
+          name: pick(b, 'recipient_name', 'recipientName', 'name'),
+          invoice: pick(b, 'reference_number', 'referenceNumber', 'invoice_number', 'invoiceNumber', 'reference_id', 'referenceId', 'invoice_id', 'invoiceId'),
           total: b.total, paid: b.paid, due: b.due, amount: b.amount, currency: b.currency
         }));
     }
     if (!messageBody) return fail('message is required (or send a known event_type to use a template).', 400);
 
-    const idempotencyKey = str(b.idempotency_key || '', 160) || null;
+    const idempotencyKey = str(pick(b, 'idempotency_key', 'idempotencyKey') || '', 160) || null;
     if (idempotencyKey) {
       const dup = await get(env,
         'SELECT id, status FROM cx_jobs WHERE workspace_id = ? AND client_id = ? AND idempotency_key = ?',
         workspace.id, key.client_id, idempotencyKey);
-      if (dup) return json({ ok: true, duplicate: true, job_id: dup.id, status: dup.status });
+      if (dup) return json({ ok: true, duplicate: true, id: dup.id, job_id: dup.id, status: dup.status });
     }
+
+    // EMS-compatible double-send guard: the same destination within 5 seconds
+    // is almost always an accidental retry.
+    const fiveSecAgo = new Date(Date.now() - 5000).toISOString();
+    const recentDup = await get(env,
+      "SELECT id FROM cx_jobs WHERE workspace_id = ? AND channel = 'sms' AND to_phone = ? AND created_at >= ? AND status != 'cancelled'",
+      workspace.id, phone, fiveSecAgo);
+    if (recentDup) return fail('Duplicate SMS detected. Please wait a few seconds before retrying.', 409);
 
     const limited = await enforceDailyLimit(env, key, workspace, 1);
     if (limited) return limited;
 
     const row = smsJobRow({
       workspaceId: workspace.id, clientId: key.client_id, apiKeyId: key.id,
-      phone, name: b.recipient_name || b.name, recipientId: b.recipient_id,
-      recipientType: b.recipient_type || 'customer',
-      messageType: b.message_type || eventType, eventType: b.event_type || eventType,
-      referenceId: b.reference_id || b.invoice_id, referenceNumber: b.reference_number || b.invoice_number,
+      phone, name: pick(b, 'recipient_name', 'recipientName', 'name'),
+      recipientId: pick(b, 'recipient_id', 'recipientId'),
+      recipientType: pick(b, 'recipient_type', 'recipientType') || 'customer',
+      messageType: pick(b, 'message_type', 'messageType') || eventType,
+      eventType: pick(b, 'event_type', 'eventType') || eventType,
+      referenceId: pick(b, 'reference_id', 'referenceId', 'invoice_id', 'invoiceId'),
+      referenceNumber: pick(b, 'reference_number', 'referenceNumber', 'invoice_number', 'invoiceNumber'),
       messageBody, idempotencyKey
     });
     await insert(env, 'cx_jobs', row);
-    return json({ ok: true, job_id: row.id, status: 'queued', workspace: workspace.code }, 201);
+    return json({
+      ok: true, id: row.id, job_id: row.id, status: 'queued', workspace: workspace.code,
+      message: '✓ SMS queued for ConnectX'
+    }, 201);
   }
 
   /* ---------------- send SMS (bulk) ------------------------------------ */
@@ -206,20 +235,22 @@ export async function clientRoutes(ctx) {
 
     const results = [];
     for (const m of messages) {
-      const phone = cleanPhone(m.to || m.phone);
-      const messageBody = str(m.message || m.message_body || '', 1600);
-      if (!phone || !messageBody) { results.push({ ok: false, error: 'phone and message are required', input: { to: m.to } }); continue; }
+      const phone = cleanPhone(pick(m, 'to', 'toPhone', 'to_phone', 'phone'));
+      const messageBody = str(pick(m, 'message', 'message_body', 'messageBody') || '', 1600);
+      if (!phone || !messageBody) { results.push({ ok: false, error: 'phone and message are required', input: { to: m.to || m.toPhone } }); continue; }
       const row = smsJobRow({
         workspaceId: workspace.id, clientId: key.client_id, apiKeyId: key.id,
-        phone, name: m.recipient_name || m.name, recipientId: m.recipient_id,
-        recipientType: m.recipient_type || 'customer',
-        messageType: m.message_type, eventType: m.event_type,
-        referenceId: m.reference_id, referenceNumber: m.reference_number,
-        messageBody, idempotencyKey: str(m.idempotency_key || '', 160) || null
+        phone, name: pick(m, 'recipient_name', 'recipientName', 'name'),
+        recipientId: pick(m, 'recipient_id', 'recipientId'),
+        recipientType: pick(m, 'recipient_type', 'recipientType') || 'customer',
+        messageType: pick(m, 'message_type', 'messageType'), eventType: pick(m, 'event_type', 'eventType'),
+        referenceId: pick(m, 'reference_id', 'referenceId', 'invoice_id', 'invoiceId'),
+        referenceNumber: pick(m, 'reference_number', 'referenceNumber', 'invoice_number', 'invoiceNumber'),
+        messageBody, idempotencyKey: str(pick(m, 'idempotency_key', 'idempotencyKey') || '', 160) || null
       });
       try {
         await insert(env, 'cx_jobs', row);
-        results.push({ ok: true, job_id: row.id, status: 'queued', to: phone });
+        results.push({ ok: true, id: row.id, job_id: row.id, status: 'queued', to: phone });
       } catch (e) {
         if (/unique|idempotency/i.test(String(e.message || ''))) results.push({ ok: true, duplicate: true, to: phone });
         else results.push({ ok: false, error: 'queue failed', to: phone });
@@ -259,10 +290,97 @@ export async function clientRoutes(ctx) {
     return json({ ok: true, cancelled: true, job_id: id });
   }
 
+  /* ---------------- send email via ConnectX (real delivery) -------------
+     The app does NOT need its own SMTP/Brevo setup: ConnectX delivers
+     through the provider configured in Settings → Email and records the
+     message so gateway phones and the console show it in email history. */
+  if (path === 'client/v1/email/send' && method === 'POST') {
+    const b = await body();
+    const ws = await resolveWorkspace(env, key, pick(b, 'workspace', 'workspace_code', 'workspaceCode'));
+    if (ws.error) return ws.error;
+    const workspace = ws.workspace;
+    if (workspace.status !== 'active') return fail('That workspace is paused in ConnectX Control.', 403);
+
+    const cfg = await emailConfig(env);
+    if (!cfg.enabled) return fail('Email sending is disabled in ConnectX Control → Settings → Email.', 403);
+    if (!cfg.apiKey) return fail('No email provider is configured yet. Add an API key in ConnectX Control → Settings → Email.', 503);
+    if (!cfg.fromEmail) return fail('Set a From Email in ConnectX Control → Settings → Email first.', 503);
+
+    const list = v => (Array.isArray(v) ? v.map(x => str(x, 320)) : str(v || '', 2000).split(','))
+      .map(x => x.trim()).filter(Boolean);
+    const to = list(pick(b, 'to', 'to_emails', 'toEmails')).filter(isEmail);
+    const cc = list(pick(b, 'cc', 'cc_emails', 'ccEmails')).filter(isEmail);
+    const bcc = list(pick(b, 'bcc', 'bcc_emails', 'bccEmails')).filter(isEmail);
+    if (!to.length) return fail('At least one valid recipient email is required (to).', 400);
+    const subject = str(b.subject || '', 500).trim();
+    if (!subject) return fail('subject is required.', 400);
+
+    const htmlRaw = str(pick(b, 'html', 'body_html', 'bodyHtml') || '', 200000);
+    const textRaw = str(pick(b, 'text', 'body', 'custom_body', 'customBody') || '', 100000);
+    if (!htmlRaw && !textRaw) return fail('Send html and/or body (plain text).', 400);
+    const html = htmlRaw || plainTextHtml(textRaw);
+
+    const idempotencyKey = str(pick(b, 'idempotency_key', 'idempotencyKey') || '', 160) || null;
+    if (idempotencyKey) {
+      const dup = await get(env,
+        "SELECT id, status FROM cx_jobs WHERE workspace_id = ? AND client_id = ? AND idempotency_key = ? AND channel = 'email'",
+        workspace.id, key.client_id, idempotencyKey);
+      if (dup) return json({ ok: true, duplicate: true, id: dup.id, job_id: dup.id, status: dup.status });
+    }
+
+    if (cfg.dailyLimit) {
+      const today = new Date().toISOString().slice(0, 10) + 'T00:00:00Z';
+      const used = await all(env,
+        "SELECT id FROM cx_jobs WHERE channel = 'email' AND status IN ('sent','sending') AND created_at >= ?", today);
+      if (used.length >= cfg.dailyLimit)
+        return fail(`ConnectX daily email limit reached (${cfg.dailyLimit}/day). Raise it in Settings → Email.`, 429);
+    }
+    const limited = await enforceDailyLimit(env, key, workspace, 1);
+    if (limited) return limited;
+
+    const row = {
+      id: uuid(), workspace_id: workspace.id, client_id: key.client_id, api_key_id: key.id,
+      channel: 'email', from_email: cfg.fromEmail,
+      to_emails: JSON.stringify(to), cc_emails: JSON.stringify(cc), bcc_emails: JSON.stringify(bcc),
+      subject, body_html: html, custom_body: textRaw,
+      recipient_type: str(pick(b, 'recipient_type', 'recipientType') || 'customer', 40),
+      recipient_id: str(pick(b, 'recipient_id', 'recipientId') || '', 80) || null,
+      recipient_name: str(pick(b, 'recipient_name', 'recipientName', 'name') || '', 160) || null,
+      message_type: str(pick(b, 'message_type', 'messageType') || 'EMAIL', 80),
+      event_type: str(pick(b, 'event_type', 'eventType') || '', 80) || null,
+      reference_id: str(pick(b, 'reference_id', 'referenceId', 'invoice_id', 'invoiceId') || '', 80) || null,
+      reference_number: str(pick(b, 'reference_number', 'referenceNumber', 'invoice_number', 'invoiceNumber') || '', 80) || null,
+      status: 'sending', attempts: 1, idempotency_key: idempotencyKey,
+      error_message: null, provider_message_id: null, created_at: nowIso(), sent_at: null
+    };
+    await insert(env, 'cx_jobs', row);
+
+    const result = await sendEmail(env, cfg, {
+      to, cc, bcc, subject, html, text: textRaw || undefined,
+      fromName: str(pick(b, 'from_name', 'fromName') || '', 160) || cfg.fromName || key.client_name,
+      replyTo: str(pick(b, 'reply_to', 'replyTo') || '', 320)
+    });
+
+    if (result.ok) {
+      const sentAt = nowIso();
+      await update(env, 'cx_jobs',
+        { status: 'sent', provider_message_id: result.messageId || null, sent_at: sentAt }, 'id = ?', row.id);
+      waitUntil?.(dispatchWebhookSafe(env, { ...row, status: 'sent', sent_at: sentAt }, 'job.sent'));
+      return json({
+        ok: true, id: row.id, job_id: row.id, status: 'sent',
+        provider_message_id: result.messageId || null, workspace: workspace.code,
+        message: '✓ Email sent via ConnectX'
+      }, 201);
+    }
+    await update(env, 'cx_jobs', { status: 'failed', error_message: result.error }, 'id = ?', row.id);
+    waitUntil?.(dispatchWebhookSafe(env, { ...row, status: 'failed', error_message: result.error }, 'job.failed'));
+    return fail(result.error, 502);
+  }
+
   /* ---------------- email history records ------------------------------ */
   if (path === 'client/v1/email' && method === 'POST') {
     const b = await body();
-    const ws = await resolveWorkspace(env, key, b.workspace || b.workspace_code);
+    const ws = await resolveWorkspace(env, key, pick(b, 'workspace', 'workspace_code', 'workspaceCode'));
     if (ws.error) return ws.error;
     const built = emailJobRow({ workspaceId: ws.workspace.id, clientId: key.client_id, apiKeyId: key.id, b });
     if (built.error) return built.error;

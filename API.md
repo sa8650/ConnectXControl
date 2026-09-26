@@ -46,11 +46,17 @@ for all (then every call must pass the workspace `code`). Each key has a daily j
 }
 ```
 
-→ `201 {"ok":true,"job_id":"…","status":"queued","workspace":"DHAKA-MAIN"}`
-Duplicate: `200 {"ok":true,"duplicate":true,"job_id":"…","status":"…"}`
+→ `201 {"ok":true,"id":"…","job_id":"…","status":"queued","workspace":"DHAKA-MAIN","message":"✓ SMS queued for ConnectX"}`
+Duplicate (idempotency_key): `200 {"ok":true,"duplicate":true,"id":"…","job_id":"…","status":"…"}`
+
+`POST /api/client/v1/sms/send` is an alias of this endpoint. All fields also accept
+EMS-style camelCase: `toPhone, messageBody, recipientName, recipientType, messageType,
+invoiceId, invoiceNumber, referenceId, referenceNumber, idempotencyKey, workspaceCode`.
+Sending to the same destination twice within 5 seconds → `409 Duplicate SMS detected`
+(anti double-click guard, same as EMS).
 
 Templates: when `message` is omitted and `event_type` matches a workspace template
-(Settings → SMS behaviour & templates), ConnectX renders it with
+(Settings → SMS gateway & templates), ConnectX renders it with
 `{name} {shop} {invoice} {total} {paid} {due} {amount} {currency}`.
 
 ### POST /api/client/v1/sms/bulk — up to 100 messages
@@ -58,7 +64,7 @@ Templates: when `message` is omitted and `event_type` matches a workspace templa
 ```json
 { "workspace": "DHAKA-MAIN", "messages": [ { "to": "+880…", "message": "…" }, … ] }
 ```
-→ `201 {"ok":true,"accepted":N,"results":[{ok,job_id}|{ok:false,error}, …]}`
+→ `201 {"ok":true,"accepted":N,"results":[{ok,id,job_id}|{ok:false,error}, …],"message":"✓ Bulk SMS queued for ConnectX"}`
 
 ### GET /api/client/v1/sms/{job_id} — status
 
@@ -73,9 +79,48 @@ Statuses: `queued → sending → sent | failed | cancelled`.
 
 Only while `queued`; `409` once a gateway claimed it. → `{"ok":true,"cancelled":true}`
 
-### Email history (optional channel)
+### POST /api/client/v1/email/send — deliver email through ConnectX
 
-Apps that send email through their own provider can mirror the outgoing record into
+ConnectX is the email gateway: the provider is configured once on the website
+(Settings → Email sending, owner only) and every app sends through this endpoint —
+no SMTP/Brevo setup needed inside the app. Delivery is synchronous; the message is
+recorded and visible in the website Messages page, the phone Email screen and
+`GET /api/client/v1/email`.
+
+```json
+{
+  "workspace": "DHAKA-MAIN",           // optional for scoped keys
+  "to": "customer@example.com",        // required; string | array | comma-separated
+  "cc": ["accounts@example.com"],      // optional
+  "bcc": ["archive@example.com"],      // optional
+  "subject": "Invoice INV-0042",       // required
+  "html": "<p>…</p>",                  // html and/or body required
+  "body": "plain text fallback",       // wrapped into simple HTML when html omitted
+  "from_name": "Dhaka Main",           // optional; defaults to workspace/app name
+  "reply_to": "sales@example.com",     // optional; defaults to platform Reply-To
+  "recipient_name": "Rahim",           // optional, for history display
+  "message_type": "INVOICE",           // optional display type (default EMAIL)
+  "reference_id": "…", "reference_number": "INV-0042",
+  "idempotency_key": "EMAIL:INV-0042"  // optional; duplicates return the original job
+}
+```
+
+→ `201 {"ok":true,"id":"…","job_id":"…","status":"sent","provider_message_id":"…","message":"✓ Email sent via ConnectX"}`
+Provider rejection / unconfirmed timeout: `502 {"error":"…"}` and the record is kept as `failed`.
+Limits: global daily email limit (Settings) and per-key daily limit → `429`.
+Disabled or unconfigured provider → `403` / `503`.
+
+Supported providers (via their HTTP send APIs — Cloudflare Workers cannot open raw
+SMTP sockets, and every major SMTP provider offers this equivalent):
+**Brevo** (`BREVO_API_KEY`), **Resend** (`RESEND_API_KEY`), **SendGrid**
+(`SENDGRID_API_KEY`), **Mailgun** (`MAILGUN_API_KEY` + domain), **Postmark**
+(`POSTMARK_SERVER_TOKEN`). The API key can be stored in the website (D1, never
+returned by any GET) or as an environment secret, which takes priority.
+`MOCK_EMAIL=1` simulates successful delivery (local demos/tests).
+
+### Email history (apps that send their own email)
+
+Apps that deliver email through their own provider can mirror the outgoing record into
 ConnectX so paired phones show unified history:
 
 - `POST /api/client/v1/email`
@@ -176,7 +221,8 @@ Paused workspaces answer `403` on device routes; revoked device tokens die insta
 `GET|POST control/clients` · `PATCH control/clients/{id}` · `POST control/clients/{id}/keys` (owner) · `POST control/keys/{id}/revoke` (owner)
 `GET|POST control/releases` · `POST control/releases/upload` (multipart APK → R2) · `PATCH|DELETE control/releases/{id}` (owner)
 `GET|POST control/carriers` · `PATCH|DELETE control/carriers/{id}`
-`GET|PATCH control/settings` (per-workspace `sms` toggles/templates, `branding`, `limits`)
+`GET|PATCH control/settings` (per-workspace `sms` toggles/templates)
+`GET|PATCH control/email` · `POST control/email/test` (owner only — provider, masked API key, from/reply-to, daily limit, enable switch, test send)
 `GET|POST control/operators` · `PATCH control/operators/{id}` (owner)
 `GET control/activity`
 
@@ -191,11 +237,12 @@ settings (not clients/keys/releases/accounts).
 |---|---|
 | 400 | validation (phone, message, workspace code, USSD format…) |
 | 401 | missing/unknown credentials or API key |
-| 403 | revoked key, disabled client, paused workspace, role violation |
+| 403 | revoked key, disabled client, paused workspace, email disabled, role violation |
 | 404 | workspace/job/release not found |
 | 405 | wrong method |
-| 409 | idempotency/cancel/claim race, duplicate code, version regression |
+| 409 | idempotency/cancel/claim race, duplicate code, 5-second SMS duplicate guard, version regression |
 | 410 | expired pairing code |
 | 422 | publish without downloadable APK |
-| 429 | daily API-key limit reached |
-| 503 | D1/R2/secret misconfiguration |
+| 429 | daily limit reached (per API key, or global email limit) |
+| 502 | email provider rejected the message, or delivery unconfirmed (timeout) |
+| 503 | email provider not configured, D1/R2/secret misconfiguration |
