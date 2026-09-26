@@ -31,8 +31,8 @@ r = await call('control/systems', { token: ownerToken });
 const keys = (r.data || []).map(s => s.system_key).sort().join(',');
 ok('seeded systems', keys === 'careos,ems,influenceos,plugx', keys);
 const ems = (r.data || []).find(s => s.system_key === 'ems');
-r = await call(`control/systems/${ems.id}`, { method: 'PATCH', token: ownerToken, body: { api_url: 'http://127.0.0.1:8799' } });
-ok('EMS api_url configured', r.data.system?.api_url === 'http://127.0.0.1:8799', JSON.stringify(r.data));
+r = await call(`control/systems/${ems.id}`, { method: 'PATCH', token: ownerToken, body: { api_url: 'http://127.0.0.1:8799', auth_mode: 'federated' } });
+ok('EMS api_url configured (federated section)', r.data.system?.api_url === 'http://127.0.0.1:8799' && r.data.system?.login_path === 'api/auth/admin/login', JSON.stringify(r.data.system));
 
 // 3. phone: system dropdown + federated login
 r = await call('device/systems');
@@ -101,7 +101,53 @@ ok('jobs list shows shop+system', r.data.items?.length >= 3 && r.data.items[0].s
 r = await call('control/shops?search=Auto', { token: ownerToken });
 ok('shops search finds auto-registered', (r.data || []).some(s => s.external_id === 'store-77'), JSON.stringify(r.data).slice(0, 200));
 
-// 10. SPA served
+// 10. EMS Public API v1 mode (api_key): switch modes, sign in, pull, report back
+const MOCK = 'http://127.0.0.1:8799';
+const FULL_KEY = 'emsk_' + 'ab'.repeat(32);
+const LIMITED_KEY = 'emsk_' + 'cd'.repeat(32);
+const mockCall = async (path, body) => {
+  const res = await fetch(MOCK + path, {
+    method: body ? 'POST' : 'GET',
+    headers: { 'content-type': 'application/json', authorization: 'Bearer ' + FULL_KEY },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  return res.json();
+};
+r = await call(`control/systems/${ems.id}`, { method: 'PATCH', token: ownerToken, body: { auth_mode: 'api_key', api_key: FULL_KEY } });
+ok('EMS switched to api_key mode (paths auto-swap)',
+  r.data.system?.auth_mode === 'api_key' && r.data.system?.login_path === 'api/v1/auth/login' && r.data.system?.shops_path === 'api/v1/shops',
+  JSON.stringify(r.data.system));
+ok('stored key is masked, never echoed',
+  r.data.system?.api_key_set === true && r.data.system?.api_key_hint === FULL_KEY.slice(0, 13) + '…' && !JSON.stringify(r.data).includes(FULL_KEY),
+  JSON.stringify(r.data.system).slice(0, 200));
+r = await call('device/auth/login', { method: 'POST', body: { system: 'ems', email: 'blocked@ems.test', password: 'ems-secret-123' } });
+ok('v1: entitlement without ConnectX blocked', r.status === 403 && /not enabled/i.test(r.data.error || ''), JSON.stringify(r.data));
+await call(`control/systems/${ems.id}`, { method: 'PATCH', token: ownerToken, body: { api_key: LIMITED_KEY } });
+r = await call('device/auth/login', { method: 'POST', body: { system: 'ems', email: 'admin@ems.test', password: 'ems-secret-123' } });
+ok('v1: missing auth:login scope surfaces owner hint', r.status === 403 && /auth:login scope/i.test(r.data.error || ''), JSON.stringify(r.data));
+await call(`control/systems/${ems.id}`, { method: 'PATCH', token: ownerToken, body: { api_key: FULL_KEY } });
+r = await call('device/auth/login', { method: 'POST', body: { system: 'ems', email: 'admin@ems.test', password: 'ems-secret-123' } });
+const adminToken2 = r.data.token;
+ok('v1: sign-in returns administrator+shops in one call',
+  !!adminToken2 && r.data.shops?.length >= 2 && r.data.administrator?.external_id === 'ems-admin-1',
+  JSON.stringify(r.data).slice(0, 300));
+
+// queue an SMS inside the mock EMS; the gateway's next poll must pull it
+r = { data: await mockCall('/api/v1/sms/send?shop_id=store-1', { phone: '+8801799999999', message: 'Pulled from EMS v1', recipientName: 'Karim' }) };
+ok('mock EMS queued a v1 job', r.data.status === 'queued' && !!r.data.id, JSON.stringify(r.data));
+r = await call('device/jobs/claim', { method: 'POST', token: deviceToken, body: { limit: 10 } });
+const pulled = (r.data.jobs || []).find(j => j.phone_number === '+8801799999999');
+ok('gateway poll pulled the v1 job (heartbeat+claim)', !!pulled && pulled.message === 'Pulled from EMS v1', JSON.stringify(r.data.jobs).slice(0, 300));
+r = await call('device/jobs/report', { method: 'POST', token: deviceToken, body: { jobId: pulled.id, status: 'sent' } });
+ok('pulled job reported sent locally', r.data.status === 'sent', JSON.stringify(r.data));
+await new Promise(rs => setTimeout(rs, 800));   // let waitUntil report-backs land
+const sink = await fetch(MOCK + '/__reports').then(x => x.json());
+ok('delivery reported back to EMS /v1/sms/report',
+  (sink.reports || []).some(x => x.jobId && x.status === 'sent' && x.found), JSON.stringify(sink.reports));
+const hb = await fetch(MOCK + '/__heartbeat').then(x => x.json());
+ok('heartbeats reached EMS (service Online)', hb.count >= 1, JSON.stringify(hb));
+
+// 11. SPA served
 const page = await fetch('http://127.0.0.1:8788/');
 ok('SPA index served', page.status === 200 && (await page.text()).includes('<div id="root">'));
 

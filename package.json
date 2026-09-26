@@ -1,6 +1,6 @@
 {
   "name": "connectx-control",
-  "version": "2.0.0",
+  "version": "2.2.0",
   "private": true,
   "type": "module",
   "description": "ConnectX Control - independent communication gateway platform (control website + gateway API + client API).",
@@ -13,8 +13,10 @@
     "pages:deploy": "npm run build && wrangler pages deploy dist --project-name=connectxweb",
     "db:local": "wrangler d1 execute connectx-control --local --file=./schema/connectx_schema.sql",
     "db:migrate:local": "wrangler d1 execute connectx-control --local --file=./schema/migrate_2_0_to_2_1.sql",
+    "db:migrate22:local": "wrangler d1 execute connectx-control --local --file=./schema/migrate_2_1_to_2_2.sql",
     "db:remote": "wrangler d1 execute connectx-control --remote --file=./schema/connectx_schema.sql",
-    "db:migrate:remote": "wrangler d1 execute connectx-control --remote --file=./schema/migrate_2_0_to_2_1.sql"
+    "db:migrate:remote": "wrangler d1 execute connectx-control --remote --file=./schema/migrate_2_0_to_2_1.sql",
+    "db:migrate22:remote": "wrangler d1 execute connectx-control --remote --file=./schema/migrate_2_1_to_2_2.sql"
   },
   "dependencies": {
     "react": "^18.3.1",

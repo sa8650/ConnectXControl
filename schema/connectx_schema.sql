@@ -38,17 +38,30 @@ CREATE TABLE IF NOT EXISTS cx_operators (
 -- Integrated systems (EMS, InfluenceOS, CareOS, PlugX, custom...).
 -- The Android app shows active systems on its sign-in screen  - ConnectX
 -- calls api_url/login_path to verify administrators and api_url/shops_path
--- to list their shops. Defaults match the shared DoxTox API convention.
+-- to list their shops.
+-- auth_mode selects the integration contract:
+--   'federated' (legacy) - login_path returns a system session token that
+--                          authorizes the shops_path call.
+--   'api_key'   (EMS Public API v1) - api_key holds the owner-issued
+--                          platform key (emsk_...); login_path is called
+--                          WITH that key and answers administrator+shops+
+--                          entitlement in one shot; ConnectX additionally
+--                          PULLS queued SMS from the system (see pull.js)
+--                          and reports results back.
 CREATE TABLE IF NOT EXISTS cx_systems (
   id          TEXT PRIMARY KEY,
   system_key  TEXT NOT NULL UNIQUE,
   name        TEXT NOT NULL,
   description TEXT NOT NULL DEFAULT '',
   api_url     TEXT NOT NULL DEFAULT '',
+  auth_mode   TEXT NOT NULL DEFAULT 'federated' CHECK (auth_mode IN ('federated','api_key')),
+  api_key     TEXT NOT NULL DEFAULT '',      -- system-side platform key (never returned by the API)
   login_path  TEXT NOT NULL DEFAULT 'api/auth/admin/login',
   shops_path  TEXT NOT NULL DEFAULT 'api/connectx/gateway/shops',
   webhook_url TEXT,
   status      TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','disabled')),
+  last_pull_at    TEXT,                      -- dispatch-loop state (api_key systems)
+  last_pull_error TEXT,
   created_at  TEXT NOT NULL,
   updated_at  TEXT NOT NULL
 );
@@ -176,6 +189,9 @@ CREATE TABLE IF NOT EXISTS cx_jobs (
   claimed_at        TEXT,
   error_message     TEXT,
   provider_message_id TEXT,
+  -- Jobs PULLED from an api_key system (EMS v1 sms/claim) carry the
+  -- system-side job id here; delivery results are reported back to it.
+  external_job_id     TEXT,
   created_at        TEXT NOT NULL,
   sent_at           TEXT
 );
@@ -184,6 +200,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_cx_jobs_idem    ON cx_jobs(shop_id, system
 CREATE INDEX IF NOT EXISTS idx_cx_jobs_claim          ON cx_jobs(shop_id, channel, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_cx_jobs_shop_created   ON cx_jobs(shop_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_cx_jobs_system_created ON cx_jobs(system_id, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cx_jobs_external ON cx_jobs(system_id, external_job_id)
+  WHERE external_job_id IS NOT NULL;
 
 -- ConnectX update channel (replaces the old EMS App Store dependency).
 CREATE TABLE IF NOT EXISTS cx_releases (

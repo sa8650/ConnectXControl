@@ -58,11 +58,13 @@ npm install
 npm run db:local                      # create local D1 tables
 # upgrading a local DB made with the old 2.0 (workspace) schema instead:
 #   npm run db:migrate:local && npm run db:local
+# upgrading a 2.1 database to 2.2 (system public-API mode):
+#   npm run db:migrate22:local && npm run db:local
 npm run pages:dev                     # backend + built SPA on http://localhost:8788
 # optional, in other terminals:
 node scripts/mock-ems.mjs             # demo "EMS-style" system API on :8799
 npm run dev                           # vite dev server on :5173 proxying /api → :8788
-npm test                              # 48 backend tests (in-memory SQLite)
+npm test                              # 61 backend tests (in-memory SQLite)
 node scripts/e2e.mjs                  # end-to-end smoke test (needs both servers above)
 ```
 
@@ -98,5 +100,11 @@ Full reference: **[API.md](API.md)** (also rendered in-app under **API Docs**).
 - `2.1.0` — **systems + shops replace workspaces**: federated administrator sign-in via
   owner-configured system API URLs, per-shop devices/jobs/pairing, shop auto-provisioning
   in the client API, system-scoped API keys and webhooks (`shop_external_id`).
+- `2.2.0` — **system public-API mode (`auth_mode: api_key`)** for the EMS Public API v1:
+  one-call sign-in (`/api/v1/auth/login` with the owner-stored `emsk_…` platform key →
+  administrator + shops + entitlement), entitlement enforcement, and the SMS **dispatch
+  loop** — ConnectX heartbeats, claims the system's queued SMS fleet-wide on every
+  gateway poll (~20 s throttle) and reports delivery results back (`/api/v1/sms/report`).
+  Keys are masked everywhere; optional Pages cron trigger for idle freshness.
 
 Built and maintained by **Dexter Studio**.

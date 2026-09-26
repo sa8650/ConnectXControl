@@ -103,6 +103,12 @@ export function pairingCode() {
 export const deviceToken = () => `cxd_${rand(32)}`;
 /** Client API keys: cxk_live_<random>. Shown once, stored hashed. */
 export const clientApiKey = () => `cxk_live_${rand(24)}`;
+/** Display form of a stored system API key (never send the full key back). */
+export const maskSecret = v => {
+  const s = String(v || '');
+  if (!s) return '';
+  return s.length > 13 ? `${s.slice(0, 13)}…` : `${s.slice(0, 4)}…`;
+};
 
 /* ---------- validators ---------- */
 export const isEmail = v => /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(String(v || '').trim());

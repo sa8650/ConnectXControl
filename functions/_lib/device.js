@@ -23,6 +23,7 @@ import {
 } from './core.js';
 import { logActivity } from './audit.js';
 import { dispatchWebhook } from './webhook.js';
+import { pullDue, pullSystemJobs, reportJobToSystem, systemHeartbeat } from './pull.js';
 
 const ADMIN_TTL = 60 * 60 * 8;             // ConnectX admin sessions (aligns with system tokens)
 const SYSTEM_CALL_TIMEOUT = 15000;         // server-to-server system API calls
@@ -139,23 +140,9 @@ function jwtExp(token) {
   } catch { return null; }
 }
 
-/** Pull the administrator's shops from the system and upsert cx_shops. */
-async function syncAdminShops(env, system, admin) {
-  let res;
-  try {
-    res = await systemFetch(env, system, system.shops_path, {
-      headers: { authorization: 'Bearer ' + admin.system_token }
-    });
-  } catch {
-    return { error: fail(`Could not reach ${system.name} to load shops. Check its API URL in ConnectX Control.`, 502) };
-  }
-  const out = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    if (res.status === 401 || res.status === 403)
-      return { error: fail(`${system.name} session expired or was rejected. Please sign in again.`, 401) };
-    return { error: fail(String(out.error || `${system.name} could not list shops.`).slice(0, 300), 502) };
-  }
-  const list = Array.isArray(out.shops) ? out.shops : [];
+/** Upsert a list of shops reported by the system, then compose the
+    administrator's shop view (shops + their gateway devices). */
+async function composeAdminShops(env, system, admin, list, administratorOut) {
   for (const st of list) {
     const externalId = str(st.id || st.store_id || '', 80);
     if (!externalId) continue;
@@ -173,25 +160,53 @@ async function syncAdminShops(env, system, admin) {
   }
   // Every shop known for this system — including ones auto-registered by the client API.
   const rows = await all(env, 'SELECT * FROM cx_shops WHERE system_id = ? ORDER BY name ASC', system.id);
-  const mine = rows;
   const devices = await all(env,
     "SELECT * FROM cx_devices WHERE admin_id = ? AND status != 'revoked'", admin.id);
   const byShop = {};
   for (const d of devices) (byShop[d.shop_id] ||= []).push(publicDevice(d));
   return {
-    administrator: out.administrator ? {
+    administrator: administratorOut ? {
       id: admin.id,
-      external_id: out.administrator.id || admin.external_id,
-      admin_code: out.administrator.admin_code || admin.admin_code || null,
-      name: out.administrator.name || admin.name || '',
-      email: out.administrator.email || admin.email || ''
+      external_id: administratorOut.id || admin.external_id,
+      admin_code: administratorOut.admin_code || admin.admin_code || null,
+      name: administratorOut.name || admin.name || '',
+      email: administratorOut.email || admin.email || ''
     } : publicAdmin(admin),
-    shops: mine.map(s => ({
+    shops: rows.map(s => ({
       ...publicShop(s),
       connected: (byShop[s.id] || []).some(d => d.status === 'active' || d.status === 'pending_test'),
       devices: byShop[s.id] || []
     }))
   };
+}
+
+/** Refresh the administrator's shops from the system.
+    api_key mode : GET shops_path?admin_id=… with the stored platform key → {items:[…]}
+    federated    : GET shops_path with the admin's system token          → {shops:[…]} */
+async function syncAdminShops(env, system, admin) {
+  const apiMode = system.auth_mode === 'api_key';
+  if (apiMode && !system.api_key)
+    return { error: fail(`${system.name} needs its API key stored in ConnectX Control before shops can sync.`, 503) };
+  let res;
+  try {
+    const qs = apiMode && admin.external_id ? `?admin_id=${encodeURIComponent(admin.external_id)}` : '';
+    res = await systemFetch(env, system, system.shops_path + qs, {
+      headers: { authorization: 'Bearer ' + (apiMode ? system.api_key : admin.system_token) }
+    });
+  } catch {
+    return { error: fail(`Could not reach ${system.name} to load shops. Check its API URL in ConnectX Control.`, 502) };
+  }
+  const out = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    if (res.status === 401 || res.status === 403)
+      return { error: fail(apiMode
+        ? `${system.name} rejected the stored API key. The ConnectX owner should update it in Systems → Configure.`
+        : `${system.name} session expired or was rejected. Please sign in again.`,
+        apiMode ? 503 : 401) };
+    return { error: fail(String(out.error || `${system.name} could not list shops.`).slice(0, 300), 502) };
+  }
+  const list = Array.isArray(out.items) ? out.items : Array.isArray(out.shops) ? out.shops : [];
+  return composeAdminShops(env, system, admin, list, out.administrator || null);
 }
 
 /* ---------- sessions ---------- */
@@ -275,16 +290,25 @@ export async function deviceRoutes(ctx) {
   /* ---------------- system list (phone app "System" dropdown) ---------- */
   if (path === 'device/systems' && method === 'GET') {
     const rows = await all(env,
-      "SELECT system_key, name, description, api_url, status FROM cx_systems WHERE status = 'active' ORDER BY created_at ASC");
+      "SELECT system_key, name, description, api_url, auth_mode, api_key, status FROM cx_systems WHERE status = 'active' ORDER BY created_at ASC");
     return json({
       systems: rows.map(r => ({
         key: r.system_key, name: r.name, description: r.description || '',
-        available: !!r.api_url        // false → owner has not connected it yet
+        // false → owner has not connected it yet (api_key systems also need their key stored)
+        available: !!r.api_url && (r.auth_mode !== 'api_key' || !!r.api_key)
       }))
     });
   }
 
-  /* ---------------- federated administrator sign-in -------------------- */
+  /* ---------------- administrator sign-in (through the system) ----------
+     Two integration modes, selected per system on the control website:
+     · api_key   — the system's public API (EMS v1 contract): ConnectX
+                   forwards email+password together with the owner-stored
+                   platform key (emsk_…); the system answers
+                   {ok, administrator, shops, entitlement} and issues NO
+                   session token — ConnectX manages its own sessions.
+     · federated — legacy: POST login_path {email,password} → {token,user},
+                   then shops are fetched with that system token.        */
   if (path === 'device/auth/login' && method === 'POST') {
     const b = await body();
     const sysKey = str(b.system || b.systemKey || b.system_key || '', 60).toLowerCase();
@@ -298,54 +322,99 @@ export async function deviceRoutes(ctx) {
     if (!system.api_url)
       return fail(`${system.name} is not connected yet. The ConnectX owner must configure its API URL first.`, 503);
 
-    let res;
-    try {
-      res = await systemFetch(env, system, system.login_path, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ email, password })
-      });
-    } catch {
-      return fail(`Could not reach ${system.name}. The ConnectX owner should check its API URL.`, 502);
+    let adminFields, shopsList = null, administratorOut = null;
+    if (system.auth_mode === 'api_key') {
+      if (!system.api_key)
+        return fail(`${system.name} uses API-key sign-in but no key is stored. The ConnectX owner must add the system API key in Systems → Configure.`, 503);
+      let res;
+      try {
+        res = await systemFetch(env, system, system.login_path, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', authorization: 'Bearer ' + system.api_key },
+          body: JSON.stringify({ email, password })
+        });
+      } catch {
+        return fail(`Could not reach ${system.name}. The ConnectX owner should check its API URL.`, 502);
+      }
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const msg = String(out.error || `${system.name} rejected the sign-in.`).slice(0, 300);
+        if (res.status === 401) return fail(msg, 401);
+        if (res.status === 403)
+          return fail(out.code === 'insufficient_scope'
+            ? `${msg} The ConnectX owner must grant the API key the auth:login scope in ${system.name}.`
+            : msg, 403);
+        return fail(`${system.name} answered: ${msg}`, 502);
+      }
+      administratorOut = out.administrator || null;
+      if (!administratorOut || !administratorOut.id)
+        return fail(`${system.name} returned an unexpected response.`, 502);
+      const ent = out.entitlement || null;
+      if (ent && ent.connectx_enabled === false)
+        return fail(`ConnectX is not enabled on your ${system.name} plan. The ${system.name} owner must enable it for your license.`, 403);
+      adminFields = {
+        external_id: str(administratorOut.id, 80),
+        name: str(administratorOut.name || '', 160),
+        admin_code: administratorOut.admin_code != null ? str(administratorOut.admin_code, 40) : null,
+        system_token: null,                 // the system issues no session in this mode
+        system_token_exp: null,
+        last_login_at: nowIso()
+      };
+      shopsList = Array.isArray(out.shops) ? out.shops : [];
+      // Show the ConnectX service Online in the system right away.
+      ctx.waitUntil?.(systemHeartbeat(env, system));
+    } else {
+      let res;
+      try {
+        res = await systemFetch(env, system, system.login_path, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ email, password })
+        });
+      } catch {
+        return fail(`Could not reach ${system.name}. The ConnectX owner should check its API URL.`, 502);
+      }
+      const out = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const status = res.status === 401 ? 401 : res.status === 403 ? 403 : 502;
+        const msg = String(out.error || `${system.name} rejected the sign-in.`).slice(0, 300);
+        // Make it obvious the answer came from the external system, not ConnectX.
+        return fail(status === 502 ? `${system.name} answered: ${msg}` : msg, status);
+      }
+      const systemToken = String(out.token || '');
+      const user = out.user || {};
+      if (!systemToken || !user.id) return fail(`${system.name} returned an unexpected response.`, 502);
+      if (out.role && !['admin', 'owner'].includes(String(out.role)))
+        return fail(`Administrator sign-in required for ${system.name}.`, 403);
+      const exp = jwtExp(systemToken);
+      adminFields = {
+        external_id: str(user.id, 80),
+        name: str(user.name || '', 160),
+        admin_code: user.admin_code != null ? str(user.admin_code, 40) : null,
+        system_token: systemToken,
+        system_token_exp: exp
+          ? new Date(exp * 1000).toISOString()
+          : new Date(Date.now() + ADMIN_TTL * 1000).toISOString(),
+        last_login_at: nowIso()
+      };
     }
-    const out = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      const status = res.status === 401 ? 401 : res.status === 403 ? 403 : 502;
-      const msg = String(out.error || `${system.name} rejected the sign-in.`).slice(0, 300);
-      // Make it obvious the answer came from the external system, not ConnectX.
-      return fail(status === 502 ? `${system.name} answered: ${msg}` : msg, status);
-    }
-    const systemToken = String(out.token || '');
-    const user = out.user || {};
-    if (!systemToken || !user.id) return fail(`${system.name} returned an unexpected response.`, 502);
-    if (out.role && !['admin', 'owner'].includes(String(out.role)))
-      return fail(`Administrator sign-in required for ${system.name}.`, 403);
 
     // Upsert the local administrator mirror (no password is ever stored).
-    const exp = jwtExp(systemToken);
-    const tokenExp = exp
-      ? new Date(exp * 1000).toISOString()
-      : new Date(Date.now() + ADMIN_TTL * 1000).toISOString();
-    const fields = {
-      external_id: str(user.id, 80),
-      name: str(user.name || '', 160),
-      admin_code: user.admin_code != null ? str(user.admin_code, 40) : null,
-      system_token: systemToken,
-      system_token_exp: tokenExp,
-      last_login_at: nowIso()
-    };
     const existing = await get(env, 'SELECT * FROM cx_admins WHERE system_id = ? AND email = ?', system.id, email);
     let admin;
     if (existing) {
-      await update(env, 'cx_admins', fields, 'id = ?', existing.id);
-      admin = { ...existing, ...fields };
+      await update(env, 'cx_admins', adminFields, 'id = ?', existing.id);
+      admin = { ...existing, ...adminFields };
     } else {
-      admin = { id: uuid(), system_id: system.id, email, ...fields, created_at: nowIso() };
+      admin = { id: uuid(), system_id: system.id, email, ...adminFields, created_at: nowIso() };
       await insert(env, 'cx_admins', admin);
     }
 
-    // Load (and cache) this administrator's shops from the system.
-    const synced = await syncAdminShops(env, system, admin);
+    // Load (and cache) this administrator's shops: straight from the login
+    // answer in api_key mode, or a follow-up shops call in federated mode.
+    const synced = shopsList
+      ? await composeAdminShops(env, system, admin, shopsList, administratorOut)
+      : await syncAdminShops(env, system, admin);
     if (synced.error) return synced.error;
 
     const token = await signToken(
@@ -354,7 +423,7 @@ export async function deviceRoutes(ctx) {
     await logActivity(env, {
       actorType: 'admin', actorId: admin.id, actorLabel: `${admin.name || email} via ${system.name}`,
       action: 'administrator sign-in', entityType: 'session', entityId: admin.id,
-      meta: { system: system.system_key, shops: synced.shops.length }
+      meta: { system: system.system_key, shops: synced.shops.length, mode: system.auth_mode || 'federated' }
     });
     return json({
       token,
@@ -369,7 +438,10 @@ export async function deviceRoutes(ctx) {
   if (path === 'device/shops' && method === 'GET') {
     const sess = await adminSession(env, request);
     if (!sess) return fail('Administrator sign-in required.', 403);
-    if (!sess.admin.system_token || new Date(sess.admin.system_token_exp || 0).getTime() < Date.now())
+    // Federated mode rides on the system session token; api_key mode uses the
+    // owner-stored platform key instead (no per-admin token exists there).
+    if (sess.system.auth_mode !== 'api_key' &&
+        (!sess.admin.system_token || new Date(sess.admin.system_token_exp || 0).getTime() < Date.now()))
       return fail(`${sess.system.name} session expired. Please sign in again.`, 401);
     const synced = await syncAdminShops(env, sess.system, sess.admin);
     if (synced.error) return synced.error;
@@ -545,6 +617,8 @@ export async function deviceRoutes(ctx) {
       "id = ? AND shop_id = ? AND status = 'queued'", jobId, shop.id);
     if (!changes) return fail('SMS was already claimed by a gateway. Refresh history.', 409);
     ctx.waitUntil?.(dispatchWebhook(env, { ...job, status: 'cancelled' }, 'job.cancelled'));
+    // A pulled job that never went out is reported failed back to its system.
+    if (job.external_job_id) ctx.waitUntil?.(reportJobToSystem(env, job, 'failed', 'Cancelled in ConnectX before sending'));
     return json({ ok: true, cancelled: true });
   };
   if (path === 'device/jobs/cancel' && method === 'POST') {
@@ -560,6 +634,13 @@ export async function deviceRoutes(ctx) {
     const b = await body();
     await touchDevice(env, device.id, { status: device.status === 'pending_test' ? 'pending_test' : 'active' });
     const limit = Math.min(20, Math.max(1, Number(b.limit || 8)));
+
+    // Public-API (api_key) systems: run their dispatch loop here so jobs
+    // queued on the system side arrive in this very poll (throttled ~20 s).
+    if (shop.system_id) {
+      const sys = await get(env, 'SELECT * FROM cx_systems WHERE id = ?', shop.system_id);
+      if (pullDue(sys)) await pullSystemJobs(env, sys);
+    }
 
     // Re-queue jobs stuck in "sending" for more than 10 minutes.
     const stale = new Date(Date.now() - 10 * 60 * 1000).toISOString();
@@ -624,6 +705,8 @@ export async function deviceRoutes(ctx) {
     await update(env, 'cx_jobs', patch, 'id = ? AND shop_id = ?', id, shop.id);
     await touchDevice(env, device.id, { status: 'active' });
     ctx.waitUntil?.(dispatchWebhook(env, { ...job, ...patch }, status === 'sent' ? 'job.sent' : 'job.failed'));
+    // Jobs pulled from a public-API system report their result back to it.
+    if (job.external_job_id) ctx.waitUntil?.(reportJobToSystem(env, job, status, patch.error_message));
     return json({ ok: true, status });
   }
 

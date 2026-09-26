@@ -67,6 +67,19 @@ catalog, settings (incl. the stored email provider key) and the audit log. Dropp
 old message history, paired devices, API keys and workspaces — re-pair phones and
 re-issue keys once after upgrading. (Local equivalents: `db:migrate:local`, `db:local`.)
 
+**Upgrading a 2.1 database to 2.2** (systems gain the public-API `auth_mode`, the
+stored system `api_key`, dispatch-loop state, and pulled jobs gain
+`external_job_id`):
+
+```bash
+npm run db:migrate22:remote   # ALTERs cx_systems/cx_jobs, points seeded EMS at /api/v1
+npm run db:remote             # re-apply the full schema (safe, IF NOT EXISTS)
+```
+
+Nothing is dropped; phones, keys and history keep working. After upgrading, open
+**Systems → EMS → Configure**, choose **Public API key** mode and paste the `emsk_…`
+key from the EMS Owner Console (see step 4 below).
+
 ---
 
 ## 4. Create the Pages project
@@ -119,10 +132,18 @@ binding.**
 2. The login page reports the platform as uninitialized → **Initialize ConnectX Control**:
    create the owner account (password ≥ 10 characters).
 3. Setup seeds the systems `EMS`, `CareOS`, `InfluenceOS`, `PlugX` — all **unconfigured**.
-4. **Systems & API Keys → Configure** each system you use: set its **API URL** (federated
-   administrator sign-in + shop sync; for EMS the default login/shops paths already match)
-   and its **webhook URL** for delivery results. Then **issue an API key** and put it into
-   that system's ConnectX configuration (see `API.md`).
+4. **Systems & API Keys → Configure** each system you use:
+   - **EMS (Public API v1 — recommended):** set the **API URL** (e.g.
+     `https://your-ems.pages.dev`), keep mode **Public API key**, and paste the platform
+     key created in the **EMS Owner Console → EMS API → Create API Key** (format
+     `emsk_` + 64 hex characters; scopes `auth:login`, `shops:read`, `sms:read`,
+     `sms:write`). Phone sign-ins are verified through `POST /api/v1/auth/login`, and
+     ConnectX **pulls** the EMS SMS queue (heartbeat + claim every ~20 s while gateways
+     poll) and **reports** delivery results back — no webhook needed.
+   - **Other systems (legacy federated):** set the **API URL** (administrator sign-in +
+     shop sync; the default login/shops paths match the shared convention) and the
+     **webhook URL** for delivery results. Then **issue an API key** and put it into that
+     system's ConnectX configuration (see `API.md`).
 5. On the phone: install the ConnectX APK → it connects to this website automatically →
    pick the **system** → sign in with a **system administrator account** → choose a
    **shop** (synced from the system) → grant SMS permissions → pick the sending SIM → run
@@ -178,6 +199,7 @@ Local dry run with a demo system: `npm run db:local && npm run pages:dev`, then
 | Restore | `npx wrangler d1 execute connectx-control --remote --file=backup.sql` |
 | Logs | Pages → Deployments → Functions logs, or `npx wrangler pages deployment tail` |
 | Rotate `SESSION_SECRET` | Pages → Settings → Secrets (invalidates web/admin sessions; device tokens keep working because they are stored as independent hashes) |
+| Optional cron (pull freshness) | Workers & Pages → your project → Settings → Triggers → Cron Triggers → add `* * * * *`. The Functions `scheduled` handler runs one dispatch-loop cycle per api_key system even when no phone is polling. Not required — gateway polls already drive the loop. |
 | Local dry run | `npm run db:local && npm run pages:dev` |
 
 ### Troubleshooting
@@ -190,7 +212,10 @@ Local dry run with a demo system: `npm run db:local && npm run pages:dev`, then
 | Release upload 503 | `APP_STORAGE` R2 binding missing, or R2 not enabled on the account |
 | `Cannot publish without a downloadable APK` | Upload the APK first, or supply a working external HTTPS `apk_url` |
 | Phone shows “Could not reach …” | The built-in `https://connectxweb.pages.dev` is unreachable — check the Pages deployment, or set your custom address on the phone (Can't connect? / Settings → ConnectX Control Address) |
-| Phone says “EMS is not connected on ConnectX yet” | The system has no **API URL** — set it under Systems & API Keys → Configure |
+| Phone says “EMS is not connected on ConnectX yet” | The system has no **API URL** (api_key systems also need their **API key**) — set them under Systems & API Keys → Configure |
+| Phone shows “…endpoint has been retired…” | The system retired its legacy ConnectX endpoints — switch it to **Public API key** mode (Systems → Configure) and store its `emsk_…` key |
+| Sign-in says the key lacks a scope | Recreate the system key with `auth:login` (never implied by read/write) + `shops:read`, `sms:read`, `sms:write` |
+| `SMS pull: error — …` pill on Systems | The stored key was revoked/expired or lacks `sms:*` scopes — fix the key; the pull retries on the next gateway poll |
 | Federated sign-in fails | Check the system's `login_path` / `shops_path` and that the system API accepts `{email,password}` → `{token,user}` and `Bearer` → `{shops:[…]}` |
 | API key 401 | Key revoked, or the system is set to `disabled` |
 | Jobs stuck in `queued` | No online gateway paired to that **shop** (Gateways page shows `online`) |

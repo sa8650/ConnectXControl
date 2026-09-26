@@ -9,20 +9,44 @@ import { all, get, insert, update, run, parseJson } from './db.js';
 import {
   json, fail, uuid, nowIso, str, bool, cleanPhone, isEmail, isUuid, isVersion, isPackage,
   dayStart, onlineOf, signToken, verifyToken, bearerOf, hashPassword, checkPassword,
-  sha256, clientApiKey, pairingCode, DEFAULT_TEMPLATES
+  sha256, clientApiKey, pairingCode, maskSecret, DEFAULT_TEMPLATES
 } from './core.js';
+import { reportJobToSystem } from './pull.js';
 import { logActivity, recentActivity } from './audit.js';
 import { publicOperator, publicShop, publicSystem, publicDevice, smsJobRow } from './device.js';
 import { apkKey, getReleaseBucket, releaseStatus, downloadPath } from './releases.js';
 import { emailConfig, providerList, sendEmail } from './email.js';
 
 const CONTROL_TTL = 60 * 60 * 12; // 12h control-panel sessions
+/* Integration modes:
+   · api_key   — the system exposes a public API authenticated with an
+                 owner-issued platform key (EMS v1: /api/v1 + emsk_ key).
+                 Sign-in forwards credentials WITH the key; ConnectX also
+                 pulls queued SMS from the system (functions/_lib/pull.js).
+   · federated — legacy: admin-password login returns a system session
+                 token used for the shops call.                            */
+const MODE_DEFAULTS = {
+  api_key:   { login_path: 'api/v1/auth/login',       shops_path: 'api/v1/shops' },
+  federated: { login_path: 'api/auth/admin/login',    shops_path: 'api/connectx/gateway/shops' }
+};
 const SEED_SYSTEMS = [
-  { key: 'ems', name: 'EMS', description: 'Enterprise Management Software — administrators sign in with their EMS account.' },
+  { key: 'ems', name: 'EMS', auth_mode: 'api_key',
+    description: 'Enterprise Management Software — administrators sign in with their EMS account through the EMS Public API (v1). Needs the owner-issued emsk_ API key with scopes: auth:login, shops:read, sms:read, sms:write.' },
   { key: 'influenceos', name: 'InfluenceOS', description: 'InfluenceOS platform integration (connect its API URL when ready).' },
   { key: 'careos', name: 'CareOS', description: 'CareOS platform integration (connect its API URL when ready).' },
   { key: 'plugx', name: 'PlugX', description: 'PlugX platform integration (connect its API URL when ready).' }
 ];
+
+/** Safe external shape of a cx_systems row — the stored api_key NEVER leaves. */
+function safeSystem(s) {
+  if (!s) return null;
+  const { api_key, ...rest } = s;
+  return {
+    ...rest,
+    api_key_set: !!api_key, api_key_hint: maskSecret(api_key),
+    configured: !!rest.api_url && (rest.auth_mode !== 'api_key' || !!api_key)
+  };
+}
 
 /* ---------- session ---------- */
 async function controlSession(env, request) {
@@ -78,11 +102,18 @@ export async function controlRoutes(ctx) {
     // the Systems page — until then phones see them as "not connected yet".
     for (const s of SEED_SYSTEMS) {
       const dup = await get(env, 'SELECT id FROM cx_systems WHERE system_key = ?', s.key);
-      if (!dup) await insert(env, 'cx_systems', {
-        id: uuid(), system_key: s.key, name: s.name, description: s.description,
-        api_url: '', login_path: 'api/auth/admin/login', shops_path: 'api/connectx/gateway/shops',
-        webhook_url: null, status: 'active', created_at: nowIso(), updated_at: nowIso()
-      });
+      if (!dup) {
+        const mode = s.auth_mode === 'api_key' ? 'api_key' : 'federated';
+        const def = MODE_DEFAULTS[mode];
+        await insert(env, 'cx_systems', {
+          id: uuid(), system_key: s.key, name: s.name, description: s.description,
+          api_url: '', auth_mode: mode, api_key: '',
+          login_path: s.login_path || def.login_path, shops_path: s.shops_path || def.shops_path,
+          webhook_url: null, status: 'active',
+          last_pull_at: null, last_pull_error: null,
+          created_at: nowIso(), updated_at: nowIso()
+        });
+      }
     }
     await logActivity(env, { actorType: 'system', action: 'platform initialized', entityType: 'operator', entityId: id });
     const token = await signToken({ id, role: 'owner', email, exp: Math.floor(Date.now() / 1000) + CONTROL_TTL }, env.SESSION_SECRET);
@@ -205,9 +236,12 @@ export async function controlRoutes(ctx) {
     for (const d of deviceCounts) devMap[d.system_id] = d.n;
     return json(rows.map(s => ({
       id: s.id, system_key: s.system_key, name: s.name, description: s.description,
-      api_url: s.api_url, login_path: s.login_path, shops_path: s.shops_path,
+      api_url: s.api_url, auth_mode: s.auth_mode || 'federated',
+      api_key_set: !!s.api_key, api_key_hint: maskSecret(s.api_key),
+      login_path: s.login_path, shops_path: s.shops_path,
       webhook_url: s.webhook_url, status: s.status,
-      configured: !!s.api_url,
+      last_pull_at: s.last_pull_at || null, last_pull_error: s.last_pull_error || null,
+      configured: !!s.api_url && (s.auth_mode !== 'api_key' || !!s.api_key),
       shops: shopMap[s.id] || 0, devices: devMap[s.id] || 0,
       created_at: s.created_at,
       usage30d: usageMap[s.id] || { sent: 0, failed: 0, pending: 0, cancelled: 0 },
@@ -223,16 +257,21 @@ export async function controlRoutes(ctx) {
     const dup = await get(env, 'SELECT id FROM cx_systems WHERE system_key = ?', key);
     if (dup) return fail('That system_key already exists.', 409);
     if (b.api_url && !validHttpUrl(b.api_url)) return fail('API URL must be a valid http(s) URL.', 400);
+    const authMode = b.auth_mode === 'api_key' ? 'api_key' : 'federated';
+    const def = MODE_DEFAULTS[authMode];
     const id = uuid();
     await insert(env, 'cx_systems', {
       id, system_key: key, name, description: str(b.description || '', 500),
       api_url: str(b.api_url || '', 500).replace(/\/+$/, ''),
-      login_path: str(b.login_path || 'api/auth/admin/login', 200),
-      shops_path: str(b.shops_path || 'api/connectx/gateway/shops', 200),
-      webhook_url: null, status: 'active', created_at: nowIso(), updated_at: nowIso()
+      auth_mode: authMode, api_key: str(b.api_key || '', 200),
+      login_path: str(b.login_path || def.login_path, 200).replace(/^\/+/, ''),
+      shops_path: str(b.shops_path || def.shops_path, 200).replace(/^\/+/, ''),
+      webhook_url: null, status: 'active',
+      last_pull_at: null, last_pull_error: null,
+      created_at: nowIso(), updated_at: nowIso()
     });
-    await auditOp(env, op, 'add system integration', 'system', id, { name, system_key: key });
-    return json({ ok: true, system: await get(env, 'SELECT * FROM cx_systems WHERE id = ?', id) }, 201);
+    await auditOp(env, op, 'add system integration', 'system', id, { name, system_key: key, auth_mode: authMode });
+    return json({ ok: true, system: safeSystem(await get(env, 'SELECT * FROM cx_systems WHERE id = ?', id)) }, 201);
   }
   if (path.match(/^control\/systems\/[^/]+$/) && ['PATCH', 'DELETE'].includes(method)) {
     if (!ownerOnly(op)) return fail('Only the owner can manage system integrations.', 403);
@@ -264,6 +303,19 @@ export async function controlRoutes(ctx) {
       if (au && !validHttpUrl(au)) return fail('API URL must be a valid http(s) URL.', 400);
       patch.api_url = au;
     }
+    if (b.auth_mode !== undefined && ['federated', 'api_key'].includes(b.auth_mode)) {
+      patch.auth_mode = b.auth_mode;
+      // Switching modes also swaps the endpoint paths when they are still the
+      // other mode's defaults, so the Configure form "just works".
+      const from = MODE_DEFAULTS[system.auth_mode === 'api_key' ? 'api_key' : 'federated'];
+      const to = MODE_DEFAULTS[b.auth_mode];
+      const curLogin = b.login_path !== undefined ? patch.login_path : system.login_path;
+      const curShops = b.shops_path !== undefined ? patch.shops_path : system.shops_path;
+      if (b.login_path === undefined && curLogin === from.login_path) patch.login_path = to.login_path;
+      if (b.shops_path === undefined && curShops === from.shops_path) patch.shops_path = to.shops_path;
+      if (b.auth_mode !== (system.auth_mode || 'federated')) patch.last_pull_error = null;
+    }
+    if (b.api_key !== undefined) patch.api_key = str(b.api_key, 200).replace(/\s+/g, '');
     if (b.login_path !== undefined) patch.login_path = str(b.login_path, 200).replace(/^\/+/, '') || system.login_path;
     if (b.shops_path !== undefined) patch.shops_path = str(b.shops_path, 200).replace(/^\/+/, '') || system.shops_path;
     if (b.webhook_url !== undefined) {
@@ -273,7 +325,7 @@ export async function controlRoutes(ctx) {
     }
     await update(env, 'cx_systems', patch, 'id = ?', id);
     await auditOp(env, op, 'update system integration', 'system', id, { fields: Object.keys(b) });
-    return json({ ok: true, system: await get(env, 'SELECT * FROM cx_systems WHERE id = ?', id) });
+    return json({ ok: true, system: safeSystem(await get(env, 'SELECT * FROM cx_systems WHERE id = ?', id)) });
   }
 
   /* ---------------- API keys (owner) ----------------------------------- */
@@ -495,6 +547,7 @@ export async function controlRoutes(ctx) {
         "id = ? AND status = 'queued'", job.id);
       if (!changes) return fail('Job was already claimed by a gateway.', 409);
       await auditOp(env, op, 'cancel job', 'job', job.id, { to: job.to_phone || job.subject });
+      if (job.external_job_id) ctx.waitUntil?.(reportJobToSystem(env, job, 'failed', 'Cancelled in ConnectX Control'));
       return json({ ok: true, cancelled: true });
     }
     // retry: re-queue failed/cancelled SMS below max attempts

@@ -4,8 +4,15 @@ import { api, SystemInfo } from '../api/client';
 import { useAuth } from '../auth/AuthContext';
 import {
   Badge, Button, Card, CopyButton, Empty, Field, Input, Modal, PageHead,
-  Spinner, TextArea, fmtDate, timeAgo, toast
+  Select, Spinner, TextArea, fmtDate, timeAgo, toast
 } from '../components/ui';
+
+/** Endpoint defaults per integration mode (mirrors MODE_DEFAULTS server-side). */
+const PATH_DEFAULTS: Record<'federated' | 'api_key', { login: string; shops: string }> = {
+  api_key:   { login: 'api/v1/auth/login',    shops: 'api/v1/shops' },
+  federated: { login: 'api/auth/admin/login', shops: 'api/connectx/gateway/shops' }
+};
+const MODE_SCOPES_HINT = 'Owner-issued platform key from the system (EMS: Owner Console → EMS API → Create API Key). Required scopes: auth:login, shops:read, sms:read, sms:write.';
 
 export default function Systems() {
   const { operator } = useAuth();
@@ -40,7 +47,7 @@ export default function Systems() {
     <>
       <PageHead
         title="Connected Systems & API Keys"
-        subtitle="Every product integrated with ConnectX — EMS, CareOS, InfluenceOS, PlugX or anything you add. The ConnectX phone app signs administrators in through the system API URL you configure here; systems push messages with API keys."
+        subtitle="Every product integrated with ConnectX — EMS, CareOS, InfluenceOS, PlugX or anything you add. The ConnectX phone app signs administrators in through the system you configure here — either its public API (with the owner-stored platform key) or the legacy password login. Systems push messages with ConnectX API keys."
         actions={isOwner ? <Button onClick={() => setAddOpen(true)}>＋ Add system</Button> : undefined}
       />
 
@@ -66,6 +73,12 @@ export default function Systems() {
             {s.api_url
               ? <span className="pill mono">api: {s.api_url.replace(/^https?:\/\//, '').slice(0, 44)}</span>
               : <span className="pill">api: not configured — phone sign-in disabled</span>}
+            {s.auth_mode === 'api_key'
+              ? <span className="pill mono">mode: public API key {s.api_key_set ? `· ${s.api_key_hint}` : '· KEY MISSING'}</span>
+              : <span className="pill">mode: admin password (legacy)</span>}
+            {s.auth_mode === 'api_key' && s.api_url && s.api_key_set && (s.last_pull_at
+              ? <span className="pill" title={s.last_pull_error || undefined}>SMS pull: {s.last_pull_error ? `error — ${s.last_pull_error.slice(0, 48)}` : timeAgo(s.last_pull_at)}</span>
+              : <span className="pill">SMS pull: waiting for first cycle</span>)}
             {s.webhook_url && <span className="pill">webhook: {s.webhook_url.replace(/^https?:\/\//, '').slice(0, 40)}</span>}
           </div>
           {(s.keys || []).length === 0
@@ -91,11 +104,24 @@ export default function Systems() {
 
       <Card title="How systems integrate">
         <p className="muted" style={{ marginTop: 0 }}>
-          Two channels, both configured here: (1) the <strong>phone app</strong> sends administrator logins to the
-          system's API URL — credentials never live on the phone; (2) the <strong>system backend</strong> calls the
-          ConnectX Client API with its key in the <span className="mono">X-ConnectX-Key</span> header and a{' '}
-          <span className="mono">shop</span> reference on every message. Delivery results are pushed back to the
-          system's webhook. Full reference: <Link to="/api-docs">API Docs</Link>.
+          <strong>Phone sign-in</strong> — the app sends administrator logins to ConnectX, which verifies them
+          against the system. Credentials never live on the phone. Two modes, chosen per system:
+        </p>
+        <ul className="muted" style={{ marginTop: 6 }}>
+          <li><strong>Public API key</strong> (EMS v1): ConnectX forwards email + password together with the
+            owner-stored platform key (<span className="mono">emsk_…</span>). The system answers with the
+            administrator, their shops and plan entitlement in one call — and ConnectX then <em>pulls</em> the
+            system's queued SMS (heartbeat + claim every ~20 s while gateways poll), delivers them through the
+            paired phones and <em>reports</em> results back to the system.</li>
+          <li><strong>Admin password (legacy federated)</strong>: the system's login endpoint returns a session
+            token that ConnectX uses to fetch the administrator's shops. Messages arrive through the Client API
+            below.</li>
+        </ul>
+        <p className="muted">
+          <strong>Client API (push)</strong> — the system backend calls ConnectX with its key in the{' '}
+          <span className="mono">X-ConnectX-Key</span> header and a <span className="mono">shop</span> reference
+          on every message. Delivery results are pushed back to the system's webhook. Full reference:{' '}
+          <Link to="/api-docs">API Docs</Link>.
         </p>
       </Card>
 
@@ -152,7 +178,7 @@ function NewKeyForm({ system, onIssued }: { system: SystemInfo; onIssued: (key: 
 }
 
 function AddSystem({ onClose, onAdded }: { onClose: () => void; onAdded: () => void }) {
-  const [form, setForm] = useState({ name: '', system_key: '', description: '', api_url: '' });
+  const [form, setForm] = useState({ name: '', system_key: '', description: '', api_url: '', auth_mode: 'federated' as 'federated' | 'api_key' });
   const [busy, setBusy] = useState(false);
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -176,6 +202,12 @@ function AddSystem({ onClose, onAdded }: { onClose: () => void; onAdded: () => v
         <Field label="API URL" hint="Base URL of the system. Used for phone-app administrator sign-in. Can be set later.">
           <Input value={form.api_url} onChange={e => setForm({ ...form, api_url: e.target.value })} placeholder="https://api.careos.example" />
         </Field>
+        <Field label="Integration mode" hint="Public API key = the system verifies sign-ins with an owner-issued platform key (EMS v1) and ConnectX pulls its queued SMS. Change anytime in Configure.">
+          <Select value={form.auth_mode} onChange={e => setForm({ ...form, auth_mode: e.target.value as 'federated' | 'api_key' })}>
+            <option value="federated">Admin password (legacy federated)</option>
+            <option value="api_key">Public API key (EMS v1)</option>
+          </Select>
+        </Field>
         <Field label="Description">
           <TextArea value={form.description} onChange={e => setForm({ ...form, description: e.target.value })} placeholder="What this product uses ConnectX for." />
         </Field>
@@ -190,16 +222,40 @@ function ConfigureSystem({ system, onClose, onSaved, onChanged }: {
 }) {
   const [form, setForm] = useState({
     name: system.name, description: system.description || '', api_url: system.api_url || '',
+    auth_mode: (system.auth_mode || 'federated') as 'federated' | 'api_key',
+    api_key: '',
     login_path: system.login_path || '', shops_path: system.shops_path || '',
     webhook_url: system.webhook_url || ''
   });
   const [busy, setBusy] = useState(false);
+  const apiKeyMode = form.auth_mode === 'api_key';
+
+  /** Switch mode; swap the endpoint paths while they are still the old mode's defaults. */
+  function setMode(mode: 'federated' | 'api_key') {
+    const from = PATH_DEFAULTS[form.auth_mode];
+    const to = PATH_DEFAULTS[mode];
+    setForm(f => ({
+      ...f, auth_mode: mode,
+      login_path: f.login_path === from.login ? to.login : f.login_path,
+      shops_path: f.shops_path === from.shops ? to.shops : f.shops_path
+    }));
+  }
+
+  async function clearKey() {
+    if (!confirm(`Remove the stored API key for ${system.name}? Phone sign-in and SMS pulling stop until a new key is saved.`)) return;
+    try {
+      await api.patch(`control/systems/${encodeURIComponent(system.id)}`, { api_key: '' });
+      toast('API key removed'); onChanged(); onClose();
+    } catch (e: any) { toast(e?.message || 'Failed', 'err'); }
+  }
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     setBusy(true);
     try {
-      await api.patch(`control/systems/${encodeURIComponent(system.id)}`, form);
+      const payload: Record<string, unknown> = { ...form };
+      if (!payload.api_key) delete payload.api_key;   // empty field = keep the stored key
+      await api.patch(`control/systems/${encodeURIComponent(system.id)}`, payload);
       toast('System configuration saved');
       onSaved();
     } catch (err: any) { toast(err?.message || 'Failed', 'err'); }
@@ -237,17 +293,49 @@ function ConfigureSystem({ system, onClose, onSaved, onChanged }: {
         <Field label="API URL" hint="Base URL of the system's API. The ConnectX phone app signs administrators in through ConnectX — the phone never talks to the system directly.">
           <Input value={form.api_url} onChange={e => setForm({ ...form, api_url: e.target.value })} placeholder="https://api.example.com" />
         </Field>
-        <div className="form-row">
-          <Field label="Admin login path" hint="POST {email,password} → {token,user}.">
-            <Input value={form.login_path} onChange={e => setForm({ ...form, login_path: e.target.value })} placeholder="api/auth/admin/login" />
+        <Field label="Integration mode" hint={apiKeyMode
+          ? 'The system exposes a public API authenticated with an owner-issued platform key (EMS v1). ConnectX verifies phone sign-ins with that key and pulls the system’s queued SMS.'
+          : 'Legacy: the system’s login endpoint returns a session token that authorizes the shops call. The system pushes messages to the ConnectX Client API.'}>
+          <Select value={form.auth_mode} onChange={e => setMode(e.target.value as 'federated' | 'api_key')}>
+            <option value="api_key">Public API key (EMS v1 — recommended)</option>
+            <option value="federated">Admin password (legacy federated)</option>
+          </Select>
+        </Field>
+        {apiKeyMode && (
+          <Field label="System API key" hint={system.api_key_set
+            ? `Stored: ${system.api_key_hint} — type a new key to replace it. Leaving this empty keeps the stored key.`
+            : MODE_SCOPES_HINT}>
+            <div className="form-row">
+              <Input type="password" value={form.api_key} autoComplete="off"
+                onChange={e => setForm({ ...form, api_key: e.target.value })}
+                placeholder={system.api_key_set ? '•••••••••••• (unchanged)' : 'emsk_…'} />
+              {system.api_key_set && <Button variant="danger" onClick={clearKey}>Remove key</Button>}
+            </div>
           </Field>
-          <Field label="Shops path" hint="GET with Bearer token → {shops:[…]}.">
-            <Input value={form.shops_path} onChange={e => setForm({ ...form, shops_path: e.target.value })} placeholder="api/connectx/gateway/shops" />
+        )}
+        <div className="form-row">
+          <Field label="Admin login path" hint={apiKeyMode
+            ? 'POST {email,password} with Bearer <api key> → {ok, administrator, shops, entitlement}.'
+            : 'POST {email,password} → {token,user}.'}>
+            <Input value={form.login_path} onChange={e => setForm({ ...form, login_path: e.target.value })} placeholder={PATH_DEFAULTS[form.auth_mode].login} />
+          </Field>
+          <Field label="Shops path" hint={apiKeyMode
+            ? 'GET ?admin_id=… with Bearer <api key> → {items:[…]} (shop refresh).'
+            : 'GET with Bearer token → {shops:[…]}.'}>
+            <Input value={form.shops_path} onChange={e => setForm({ ...form, shops_path: e.target.value })} placeholder={PATH_DEFAULTS[form.auth_mode].shops} />
           </Field>
         </div>
         <Field label="Webhook URL" hint="Delivery reports (job.sent / job.failed / job.cancelled) are POSTed here. HTTPS only; signed with x-connectx-signature. Empty = disabled.">
           <Input value={form.webhook_url} onChange={e => setForm({ ...form, webhook_url: e.target.value })} placeholder="https://api.example.com/hooks/connectx" />
         </Field>
+        {apiKeyMode && (
+          <div className="form-note">
+            While a gateway is polling, ConnectX runs the system's dispatch loop every ~20 s: heartbeat, claim
+            queued SMS across all shops, deliver through the paired phones, report results back to the system.
+            {system.last_pull_at ? ` Last pull: ${timeAgo(system.last_pull_at)}.` : ''}
+            {system.last_pull_error ? ` Last pull error: ${system.last_pull_error}` : ''}
+          </div>
+        )}
         <div className="pill-row" style={{ marginTop: 14 }}>
           <Button type="submit" disabled={busy}>{busy ? 'Saving…' : 'Save configuration'}</Button>
           <Button variant={system.status === 'active' ? 'danger' : 'soft'} onClick={toggleStatus}>

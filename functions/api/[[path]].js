@@ -15,6 +15,7 @@ import { deviceRoutes } from '../_lib/device.js';
 import { clientRoutes } from '../_lib/client.js';
 import { publicReleaseRoutes } from '../_lib/releases.js';
 import { json, fail } from '../_lib/core.js';
+import { pullAllSystems } from '../_lib/pull.js';
 
 const CORS_HEADERS = {
   'access-control-allow-origin': '*',
@@ -52,7 +53,7 @@ export async function onRequest(context) {
     else if (path.startsWith('device/')) response = await deviceRoutes(ctx);
     else if (path.startsWith('client/')) response = await clientRoutes(ctx);
     else if (path.startsWith('public/')) response = await publicReleaseRoutes(ctx);
-    else if (path === '' || path === 'health') response = json({ ok: true, service: 'connectx-control', version: '2.1.0' });
+    else if (path === '' || path === 'health') response = json({ ok: true, service: 'connectx-control', version: '2.2.0' });
     else response = fail('Unknown ConnectX API endpoint.', 404);
 
     return withCors(response || fail('Unknown ConnectX API endpoint.', 404));
@@ -67,5 +68,20 @@ export async function onRequest(context) {
     if (/no such table: cx_/.test(msg))
       return withCors(fail('The ConnectX database schema is not installed yet. Apply it: npm run db:remote (upgrading from 2.0? run npm run db:migrate:remote first) — see DEPLOY.md §3.', 503));
     return withCors(fail('Internal ConnectX error: ' + msg, 500));
+  }
+}
+
+/* =====================================================================
+   Optional cron entry point (Cloudflare Pages → Settings → Triggers →
+   Cron Triggers, e.g. "* * * * *"): runs one dispatch-loop cycle for
+   every api_key system even when no gateway is polling. The loop also
+   rides along on every gateway poll, so cron is a freshness bonus,
+   not a requirement.
+   ===================================================================== */
+export async function scheduled(event, env, ctx) {
+  try {
+    if (env && env.DB) await pullAllSystems(env);
+  } catch (error) {
+    console.error('ConnectX scheduled pull error:', error);
   }
 }

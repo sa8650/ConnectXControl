@@ -54,8 +54,14 @@ export interface Operator {
 /** An external product ConnectX integrates with (EMS, InfluenceOS, CareOS, PlugX…). */
 export interface SystemInfo {
   id: string; system_key: string; name: string; description: string;
-  api_url: string; login_path: string; shops_path: string;
+  api_url: string;
+  /** 'api_key' = system public API with owner-stored platform key (EMS v1);
+      'federated' = legacy admin-password login returning a system token. */
+  auth_mode: 'federated' | 'api_key';
+  api_key_set: boolean; api_key_hint: string;
+  login_path: string; shops_path: string;
   webhook_url: string | null; status: 'active' | 'disabled';
+  last_pull_at?: string | null; last_pull_error?: string | null;
   configured: boolean; shops: number; devices: number; created_at: string;
   usage30d?: { sent: number; failed: number; pending: number; cancelled: number };
   keys?: ApiKeyInfo[];

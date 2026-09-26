@@ -123,7 +123,7 @@ test('phone sees the system list; unconfigured systems are marked unavailable', 
   assert.ok(bad.error, 'invalid API URL rejected');
   const patched = await control(`control/systems/${emsSystemId}`, {
     method: 'PATCH', token: ownerToken,
-    body: { api_url: 'https://ems.test/', webhook_url: 'https://ems.test/hooks/connectx' }
+    body: { api_url: 'https://ems.test/', auth_mode: 'federated', webhook_url: 'https://ems.test/hooks/connectx' }
   });
   assert.equal(patched.system.api_url, 'https://ems.test', 'trailing slash trimmed');
 

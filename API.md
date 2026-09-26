@@ -151,6 +151,31 @@ x-connectx-signature: sha256=…        // HMAC-SHA256 of the raw body (WEBHOOK_
 HTTPS only; private/loopback IPs are blocked; 8 s timeout; failures are logged, never
 retried into your face (poll `GET /sms/{id}` as a fallback).
 
+### Pull mode — system public APIs (`auth_mode: "api_key"`, e.g. EMS Public API v1)
+
+Systems that expose an **owner-issued platform key** (EMS: `emsk_…`, created in the EMS
+Owner Console with scopes `auth:login`, `shops:read`, `sms:read`, `sms:write`) do not
+push messages here — ConnectX **pulls** them, following the system's own dispatch-loop
+contract:
+
+```
+every ~20 s (driven by gateway polls, optional cron when idle):
+  POST {system}/api/v1/heartbeat           → marks ConnectX Online in the system
+  POST {system}/api/v1/sms/claim {limit:8} → queued jobs across ALL shops of that system
+  ... ConnectX delivers through the paired phones ...
+  POST {system}/api/v1/sms/report          → {jobId, status:"sent"|"failed", error?}
+```
+
+- Claimed jobs are imported once (deduped on `system_id + external_job_id`); shops that
+  were never synced auto-register so nothing is lost.
+- Delivery results (and console/gateway cancellations, reported as `failed`) are sent
+  back to the system automatically; the system's `report` endpoint is the source of
+  truth for its own history.
+- Pull state is visible on the Systems page (`last_pull_at`, `last_pull_error`).
+- Administrator sign-in for such systems uses `POST {system}/api/v1/auth/login` with the
+  stored key (see Device API below) — the system answers with administrator, shops and
+  plan entitlement in one call and issues no session token.
+
 ---
 
 ## 2. Device API (ConnectX Android app)
@@ -163,14 +188,16 @@ server-side to the system's own API (owner-configured URL).
 
 | Endpoint | Auth | Purpose |
 |---|---|---|
-| `GET device/systems` | — | `{systems:[{id,key,name,available}]}` — the sign-in dropdown. `available` = the owner set an API URL. URLs are never exposed. |
-| `POST device/auth/login` | — | `{system:"ems", email, password}` → ConnectX calls the system's admin-login endpoint → `{token, admin, administrator, system, shops:[…]}`. Wrong credentials pass the system's own error through (401/403). |
+| `GET device/systems` | — | `{systems:[{id,key,name,available}]}` — the sign-in dropdown. `available` = the owner set an API URL (api_key systems also need their stored key). URLs/keys are never exposed. |
+| `POST device/auth/login` | — | `{system:"ems", email, password}` → ConnectX verifies against the system → `{token, admin, administrator, system, shops:[…]}`. **api_key mode:** one call `POST api/v1/auth/login` with the owner-stored `emsk_…` key returns administrator + shops + entitlement; `entitlement.connectx_enabled === false` blocks sign-in (403). **federated mode:** the system's admin-login endpoint returns a session token used for the shops call. Wrong credentials pass the system's own error through (401/403). |
 | `GET device/shops` | admin | Re-sync from the system + `{administrator, system, shops:[{id, external_id, name, shop_code, address, phone, category, status, system_status, connected, devices:[…]}]}` |
 | `POST device/register` | admin | `{shopId, deviceName, androidVersion, appVersion, simSubscriptionId, simCarrier, phoneNumber}` → `{device, deviceToken, shop, system, administrator}` |
 | `POST device/pair` | — | Account-free: `{code, deviceName, androidVersion, appVersion, simSubscriptionId, simCarrier, phoneNumber}` → same shape (`administrator` may be null). Codes: `4F7K-9Q2M`, single use, per shop, generated in Gateways. |
 
-Admin sessions expire with the system's own session; `device/shops` then answers 401 and
-the app returns to sign-in.
+In federated mode admin sessions expire with the system's own session; `device/shops`
+then answers 401 and the app returns to sign-in. In api_key mode there is no system
+session — ConnectX issues its own 8 h admin token and refreshes shops with the stored
+platform key (`GET api/v1/shops?admin_id=…`).
 
 ### Paired device (bearer `cxd_…`)
 
@@ -178,8 +205,8 @@ the app returns to sign-in.
 |---|---|
 | `GET device/me` | `{device, shop, system, administrator, connectedShopIds}` |
 | `POST device/heartbeat` | Liveness (`last_seen`), optional `{deviceName, appVersion, smsEnabled}` patch |
-| `POST device/jobs/claim` | `{limit≤20}` → `{jobs:[{id, shop_id, shop_external_id, system_key, phone_number, message, event_type, message_type, recipient_name, invoice_id, reference_id, reference_number, created_at, attempts}]}`; race-safe; re-queues jobs stuck `sending` > 10 min |
-| `POST device/jobs/report` | `{jobId, status:"sent"|"failed", error?}` → fires the system webhook |
+| `POST device/jobs/claim` | `{limit≤20}` → `{jobs:[{id, shop_id, shop_external_id, system_key, phone_number, message, event_type, message_type, recipient_name, invoice_id, reference_id, reference_number, created_at, attempts}]}`; race-safe; re-queues jobs stuck `sending` > 10 min. For api_key systems each poll also runs one throttled dispatch-loop cycle (heartbeat + claim of the system's queue) so fresh system jobs arrive immediately. |
+| `POST device/jobs/report` | `{jobId, status:"sent"|"failed", error?}` → fires the system webhook and, for pulled jobs (`external_job_id`), reports the result back to the originating system |
 | `POST device/jobs/cancel` / `DELETE device/jobs/{id}` | Cancel while `queued` (409 once claimed) |
 | `POST device/test` | `{ok, to?, message?, record?}` — mark setup test and/or queue a real test SMS |
 | `PATCH device/sim` | `{simSubscriptionId, simCarrier, phoneNumber}` |
@@ -205,7 +232,7 @@ provider); **operator** = day-to-day (shops, gateways, jobs, carriers, settings 
 |---|---|
 | Bootstrap | `GET control/bootstrap` · `POST control/setup` · `POST control/auth/login` · `PATCH control/auth/profile` · `PATCH control/auth/password` · `POST control/auth/logout` |
 | Dashboard | `GET control/dashboard?utcOffsetMinutes=` → today counters, devices, shops, systems (incl. `connected`), `bySystem`, recent jobs |
-| Systems | `GET|POST control/systems` · `PATCH|DELETE control/systems/{id}` (name, description, `api_url`, `login_path`, `shops_path`, `webhook_url`, status; DELETE blocked while jobs/devices exist) · `POST control/systems/{id}/keys` (owner; key shown once) · `POST control/keys/{id}/revoke` |
+| Systems | `GET|POST control/systems` · `PATCH|DELETE control/systems/{id}` (name, description, `api_url`, `auth_mode` `"federated"`\|`"api_key"`, `api_key` — stored for server-side calls, **never returned**, only `api_key_set`/`api_key_hint`; switching modes swaps default `login_path`/`shops_path`; plus `webhook_url`, status; DELETE blocked while jobs/devices exist) · `POST control/systems/{id}/keys` (owner; ConnectX-side key shown once) · `POST control/keys/{id}/revoke` |
 | Shops | `GET control/shops?system_id=&status=&search=` (with device/online counts) · `POST control/shops` (manual pre-registration) · `PATCH control/shops/{id}` (name, shop_code, status) · `DELETE control/shops/{id}` (blocked while devices/history exist) |
 | Gateways | `GET control/devices?shop_id=` · `POST control/devices/pairing-code {shop_id, ttl_minutes}` · `POST control/devices/{id}/revoke|restore|primary|rename` |
 | Jobs | `GET control/jobs?channel=&status=&shop_id=&system_id=&search=&since=&limit=&offset=` · `POST control/jobs` (manual send `{shop_id,to,message}`) · `POST control/jobs/{id}/cancel|retry` |
