@@ -1,0 +1,31 @@
+{
+  "name": "connectx-control",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "ConnectX Control - independent communication gateway platform (control website + gateway API + client API).",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "test": "node --test test/",
+    "pages:dev": "wrangler pages dev dist --d1=DB --r2=APP_STORAGE --port 8788",
+    "pages:deploy": "npm run build && wrangler pages deploy dist --project-name=connectx-control",
+    "db:local": "wrangler d1 execute connectx-control --local --file=./schema/connectx_schema.sql",
+    "db:remote": "wrangler d1 execute connectx-control --remote --file=./schema/connectx_schema.sql"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.26.2"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.11",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.2",
+    "better-sqlite3": "^11.10.0",
+    "typescript": "^5.6.2",
+    "vite": "^5.4.8",
+    "wrangler": "^4.86.0"
+  }
+}

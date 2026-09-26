@@ -1,0 +1,23 @@
+#:schema node_modules/wrangler/config-schema.json
+name = "connectx-control"
+compatibility_date = "2026-05-03"
+pages_build_output_dir = "./dist"
+
+# ConnectX owns its database. It is NOT the EMS database and never reads EMS tables.
+[[d1_databases]]
+binding = "DB"
+database_name = "connectx-control"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+
+# APK / release-artifact storage for the ConnectX update channel.
+[[r2_buckets]]
+binding = "APP_STORAGE"
+bucket_name = "connectx-releases"
+
+# Required secret: wrangler pages secret put SESSION_SECRET
+# Optional secrets:
+#   BREVO_API_KEY   - only if ConnectX should relay email jobs itself
+#   WEBHOOK_SIGNING_SECRET - signs outbound client webhook payloads
+
+[vars]
+DEFAULT_DAILY_LIMIT = "1000"
