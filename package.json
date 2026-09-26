@@ -10,7 +10,7 @@
     "preview": "vite preview",
     "test": "node --test test/",
     "pages:dev": "wrangler pages dev dist --port 8788",
-    "pages:deploy": "npm run build && wrangler pages deploy dist --project-name=connectx-control",
+    "pages:deploy": "npm run build && wrangler pages deploy dist --project-name=connectxweb",
     "db:local": "wrangler d1 execute connectx-control --local --file=./schema/connectx_schema.sql",
     "db:remote": "wrangler d1 execute connectx-control --remote --file=./schema/connectx_schema.sql"
   },
