@@ -311,7 +311,9 @@ export async function deviceRoutes(ctx) {
     const out = await res.json().catch(() => ({}));
     if (!res.ok) {
       const status = res.status === 401 ? 401 : res.status === 403 ? 403 : 502;
-      return fail(String(out.error || `${system.name} rejected the sign-in.`).slice(0, 300), status);
+      const msg = String(out.error || `${system.name} rejected the sign-in.`).slice(0, 300);
+      // Make it obvious the answer came from the external system, not ConnectX.
+      return fail(status === 502 ? `${system.name} answered: ${msg}` : msg, status);
     }
     const systemToken = String(out.token || '');
     const user = out.user || {};
