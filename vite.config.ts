@@ -1,3 +1,4 @@
+import path from 'node:path';
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
@@ -5,6 +6,7 @@ import react from '@vitejs/plugin-react';
 // browser never needs another origin (works in sandboxed previews too).
 export default defineConfig({
   plugins: [react()],
+  resolve: { alias: { '@': path.resolve(__dirname, 'src') } },
   server: {
     host: '0.0.0.0',
     port: 5173,

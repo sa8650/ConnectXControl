@@ -5,15 +5,12 @@ import Layout from './components/Layout';
 import { Toaster, Spinner } from './components/ui';
 import Login from './pages/Login';
 import Dashboard from './pages/Dashboard';
-import Devices from './pages/Devices';
 import Jobs from './pages/Jobs';
-import Shops from './pages/Shops';
-import Systems from './pages/Systems';
 import Releases from './pages/Releases';
-import Carriers from './pages/Carriers';
-import ApiDocs from './pages/ApiDocs';
 import Activity from './pages/Activity';
 import Settings from './pages/Settings';
+import ConnectApp from './pages/ConnectApp';
+import Phones from './pages/Phones';
 
 function Protected({ children }: { children: React.ReactNode }) {
   const { operator, loading } = useAuth();
@@ -33,15 +30,17 @@ export default function App() {
           operator ? <Navigate to="/" replace /> : <Login setupMode={!initialized} />
         } />
         <Route path="/" element={<Protected><Dashboard /></Protected>} />
-        <Route path="/devices" element={<Protected><Devices /></Protected>} />
+        <Route path="/connect" element={<Protected><ConnectApp /></Protected>} />
+        <Route path="/phones" element={<Protected><Phones /></Protected>} />
         <Route path="/jobs" element={<Protected><Jobs /></Protected>} />
-        <Route path="/shops" element={<Protected><Shops /></Protected>} />
-        <Route path="/systems" element={<Protected><Systems /></Protected>} />
-        <Route path="/workspaces" element={<Navigate to="/shops" replace />} />
-        <Route path="/clients" element={<Navigate to="/systems" replace />} />
+        <Route path="/devices" element={<Navigate to="/connect" replace />} />
+        <Route path="/shops" element={<Navigate to="/connect" replace />} />
+        <Route path="/systems" element={<Navigate to="/connect" replace />} />
+        <Route path="/api-docs" element={<Navigate to="/connect" replace />} />
+        <Route path="/workspaces" element={<Navigate to="/connect" replace />} />
+        <Route path="/clients" element={<Navigate to="/connect" replace />} />
         <Route path="/releases" element={<Protected><Releases /></Protected>} />
-        <Route path="/carriers" element={<Protected><Carriers /></Protected>} />
-        <Route path="/api-docs" element={<Protected><ApiDocs /></Protected>} />
+        <Route path="/carriers" element={<Navigate to="/settings" replace />} />
         <Route path="/activity" element={<Protected><Activity /></Protected>} />
         <Route path="/settings" element={<Protected><Settings /></Protected>} />
         <Route path="*" element={<Navigate to="/" replace />} />

@@ -1,102 +1,79 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { api, Dashboard as Dash } from '../api/client';
-import { Badge, Card, Empty, PageHead, Spinner, Stat, fmtDate, timeAgo } from '../components/ui';
+import { api } from '../api/client';
+import { Badge, Card, Empty, PageHead, Stat, timeAgo } from '../components/ui';
+
+type Job = { request_id: string; recipient: string; status: string; remote_name?: string; created_at: string; reason?: string };
+type Dash = {
+  identity: { application_id: string; connect_endpoint: string };
+  counts: { pending: number; processing: number; success: number; failed: number };
+  android_online: number;
+  products_connected: number;
+  connections: Array<{ display_name: string; remote_kind: string; connected: boolean; online?: boolean; remote_application_name: string }>;
+  jobs: Job[];
+  requests: unknown[];
+};
 
 export default function Dashboard() {
   const [data, setData] = useState<Dash | null>(null);
   const [error, setError] = useState('');
-
   const load = useCallback(async () => {
-    try {
-      const offset = -new Date().getTimezoneOffset();
-      setData(await api.get<Dash>(`control/dashboard?utcOffsetMinutes=${offset}`));
-      setError('');
-    } catch (e: any) { setError(e?.message || 'Failed to load dashboard.'); }
+    try { setData(await api.get<Dash>('control/connect')); setError(''); }
+    catch (e: any) { setError(e?.message || 'Failed to load dashboard.'); }
   }, []);
+  useEffect(() => { load(); const t = setInterval(load, 20000); return () => clearInterval(t); }, [load]);
 
-  useEffect(() => { load(); const t = setInterval(load, 30000); return () => clearInterval(t); }, [load]);
-
-  if (error) return <Card title="Dashboard"><div className="form-error">{error}</div></Card>;
-  if (!data) return <div className="center-screen"><Spinner /></div>;
-
-  const systems = Object.entries(data.bySystem);
+  if (error && !data) return <Card title="Dashboard"><div className="form-error">{error}</div></Card>;
+  if (!data) return <div className="center-screen">Loading…</div>;
+  const moving = data.counts.pending + data.counts.processing;
 
   return (
     <>
       <PageHead
         title="Dashboard"
-        subtitle="Live state of the ConnectX platform — gateways, message traffic and connected products."
-        actions={<button className="btn btn-ghost btn-sm" onClick={load}>↻ Refresh</button>}
+        subtitle="One connection to each product. ConnectX owns the Android phone and the SIM. Results travel back the same path."
+        actions={<button className="btn btn-ghost btn-sm" onClick={load}>Refresh</button>}
       />
-
       <div className="grid grid-4" style={{ marginBottom: 16 }}>
-        <Stat label="SMS sent today" value={data.today.smsSent} tone="good" />
-        <Stat label="SMS pending" value={data.today.smsPending} tone="info" hint="queued + sending" />
-        <Stat label="SMS failed today" value={data.today.smsFailed} tone={data.today.smsFailed ? 'bad' : 'default'} />
-        <Stat label="Emails logged today" value={data.today.emailSent} tone="default" hint={`${data.today.emailFailed} failed · ${data.today.emailPending} pending`} />
+        <Stat label="Products connected" value={data.products_connected} tone={data.products_connected ? 'good' : 'warn'} hint={data.identity.application_id} />
+        <Stat label="Phones online" value={data.android_online} tone={data.android_online ? 'good' : 'warn'} hint="Android Phones page" />
+        <Stat label="SMS moving" value={moving} tone="info" hint={`${data.counts.pending} pending · ${data.counts.processing} processing`} />
+        <Stat label="SMS failed" value={data.counts.failed} tone={data.counts.failed ? 'bad' : 'default'} hint={`${data.counts.success} succeeded`} />
       </div>
-      <div className="grid grid-4" style={{ marginBottom: 16 }}>
-        <Stat label="Gateways online" value={`${data.devices.online}/${data.devices.total}`} tone={data.devices.online ? 'good' : 'warn'} hint="seen in last 3 minutes" />
-        <Stat label="Pending test" value={data.devices.pendingTest} tone={data.devices.pendingTest ? 'warn' : 'default'} hint="awaiting first test SMS" />
-        <Stat label="Shops" value={data.shops.total} hint={`${data.shops.active} active`} />
-        <Stat label="Connected systems" value={data.systems.total} hint={`${data.systems.connected} with API URL`} />
-      </div>
-
       <div className="grid grid-2">
-        <Card title="Traffic by system" subtitle="Today, per connected product (client API keys)">
-          {systems.length === 0
-            ? <Empty>No system traffic yet. Issue an API key under <Link to="/systems">Systems &amp; API Keys</Link>.</Empty>
-            : <div className="table-wrap"><table className="table">
-                <thead><tr><th>System</th><th>Sent</th><th>Failed</th><th>Pending</th></tr></thead>
-                <tbody>
-                  {systems.map(([name, u]) => (
-                    <tr key={name}>
-                      <td className="td-main">{name}</td>
-                      <td>{u.sent}</td>
-                      <td>{u.failed}</td>
-                      <td>{u.pending}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table></div>}
+        <Card title="Connections" actions={<Link className="btn btn-ghost btn-sm" to="/connect">Open Connect App</Link>}>
+          {data.connections.filter(c => c.connected).length === 0
+            ? <Empty>Nothing is connected. <Link to="/connect">Connect App</Link> is where a product connects. Phones are listed under Android Phones.</Empty>
+            : <div className="table-wrap"><table className="table"><thead><tr><th>Name</th><th>Kind</th><th>State</th></tr></thead><tbody>
+              {data.connections.filter(c => c.connected).map((c, i) => (
+                <tr key={i}><td className="td-main">{c.display_name || c.remote_application_name}</td><td>{c.remote_kind}</td><td>{c.remote_kind === 'android' && c.online ? <Badge value="Online" tone="good" /> : <Badge value="Connected" tone="good" />}</td></tr>
+              ))}
+            </tbody></table></div>}
         </Card>
-
-        <Card title="Quick actions">
-          <div className="pill-row" style={{ flexDirection: 'column', alignItems: 'stretch', gap: 10 }}>
-            <Link className="btn btn-soft" to="/devices">▣ Pair an Android gateway (generate pairing code)</Link>
-            <Link className="btn btn-soft" to="/systems">⚿ Configure systems & issue API keys (EMS / CareOS / InfluenceOS / PlugX)</Link>
-            <Link className="btn btn-soft" to="/releases">↥ Publish a ConnectX app release (updates channel)</Link>
-            <Link className="btn btn-soft" to="/jobs">≡ Inspect or cancel queued messages</Link>
-          </div>
+        <Card title="How a message moves">
+          <ol className="muted" style={{ margin: 0, paddingLeft: 18, display: 'grid', gap: 8 }}>
+            <li>EMS asks its Connect Server to send SMS-10001.</li>
+            <li>ConnectX checks the connection and keeps the job if the phone is offline.</li>
+            <li>The Android app sends it on the SIM the user selected.</li>
+            <li>SUCCESS or FAILED returns to EMS on the same Request ID.</li>
+          </ol>
         </Card>
       </div>
-
-      <Card title="Recent messages" subtitle="Newest jobs across every system, shop and gateway"
-        actions={<Link className="btn btn-ghost btn-sm" to="/jobs">Open Messages →</Link>}>
-        {data.recentJobs.length === 0
-          ? <Empty>No messages yet. They appear here as systems push jobs through the ConnectX client API.</Empty>
-          : <div className="table-wrap"><table className="table">
-              <thead><tr><th>To</th><th>Type</th><th>System</th><th>Shop</th><th>Status</th><th>Created</th></tr></thead>
-              <tbody>
-                {data.recentJobs.map(j => (
-                  <tr key={j.id}>
-                    <td>
-                      <div className="td-main mono">{j.to || '—'}</div>
-                      <div className="td-sub">{j.recipient_name || ''}</div>
-                    </td>
-                    <td>
-                      <div className="td-main">{j.message_type || j.channel.toUpperCase()}</div>
-                      <div className="td-sub">{j.channel}</div>
-                    </td>
-                    <td>{j.system_name}</td>
-                    <td>{j.shop_name || '—'}</td>
-                    <td><Badge value={j.status} /></td>
-                    <td className="td-sub" title={fmtDate(j.created_at)}>{timeAgo(j.created_at)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table></div>}
+      <Card title="Recent SMS" actions={<Link className="btn btn-ghost btn-sm" to="/jobs">All messages</Link>}>
+        {data.jobs.length === 0 ? <Empty>No SMS yet. They appear after a connected product sends one.</Empty> : (
+          <div className="table-wrap"><table className="table">
+            <thead><tr><th>Request</th><th>To</th><th>From</th><th>Status</th><th>When</th></tr></thead>
+            <tbody>{data.jobs.slice(0, 8).map(j => (
+              <tr key={j.request_id + j.created_at}>
+                <td className="mono">{j.request_id}</td>
+                <td>{j.recipient}</td>
+                <td>{j.remote_name || '—'}</td>
+                <td><Badge value={j.status} tone={j.status === 'SUCCESS' ? 'good' : j.status === 'FAILED' ? 'bad' : j.status === 'PROCESSING' ? 'info' : 'warn'} /></td>
+                <td>{timeAgo(j.created_at)}</td>
+              </tr>
+            ))}</tbody>
+          </table></div>
+        )}
       </Card>
     </>
   );

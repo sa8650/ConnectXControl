@@ -11,11 +11,10 @@
    sessions. ConnectX is the source of truth for its own platform.
    ===================================================================== */
 import { controlRoutes } from '../_lib/control.js';
-import { deviceRoutes } from '../_lib/device.js';
-import { clientRoutes } from '../_lib/client.js';
 import { publicReleaseRoutes } from '../_lib/releases.js';
 import { json, fail } from '../_lib/core.js';
-import { pullAllSystems } from '../_lib/pull.js';
+import { connectControlRoutes, retryCallbacks } from '../_lib/connect.js';
+import { phoneGatewayRoutes } from '../_lib/phone_gateway.js';
 
 const CORS_HEADERS = {
   'access-control-allow-origin': '*',
@@ -49,11 +48,13 @@ export async function onRequest(context) {
     if (!env.SESSION_SECRET) return withCors(fail('SESSION_SECRET is not configured. Run: wrangler pages secret put SESSION_SECRET', 503));
 
     let response = null;
-    if (path.startsWith('control/')) response = await controlRoutes(ctx);
-    else if (path.startsWith('device/')) response = await deviceRoutes(ctx);
-    else if (path.startsWith('client/')) response = await clientRoutes(ctx);
+    if (path.startsWith('control/connect')) response = await connectControlRoutes(ctx);
+    else if (path.startsWith('control/phones')) response = await phoneGatewayRoutes(ctx);
+    else if (path.startsWith('control/')) response = await controlRoutes(ctx);
+    else if (path.startsWith('device/')) response = await phoneGatewayRoutes(ctx);
+    else if (path.startsWith('client/')) response = fail('The API-key client API has been removed. Products connect through Connect App: POST /connect.', 410);
     else if (path.startsWith('public/')) response = await publicReleaseRoutes(ctx);
-    else if (path === '' || path === 'health') response = json({ ok: true, service: 'connectx-control', version: '2.2.0' });
+    else if (path === '' || path === 'health') response = json({ ok: true, service: 'connectx-control', version: '3.0.0', connect: '/connect' });
     else response = fail('Unknown ConnectX API endpoint.', 404);
 
     return withCors(response || fail('Unknown ConnectX API endpoint.', 404));
@@ -80,8 +81,8 @@ export async function onRequest(context) {
    ===================================================================== */
 export async function scheduled(event, env, ctx) {
   try {
-    if (env && env.DB) await pullAllSystems(env);
+    if (env && env.DB) await retryCallbacks(env);
   } catch (error) {
-    console.error('ConnectX scheduled pull error:', error);
+    console.error('ConnectX result callback error:', error);
   }
 }

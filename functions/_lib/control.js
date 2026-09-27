@@ -578,8 +578,10 @@ export async function controlRoutes(ctx) {
     const code = Number(b.version_code || 0);
     if (!isPackage(pkg)) return fail('Invalid Android package name.', 400);
     if (!isVersion(version) || !Number.isSafeInteger(code) || code <= 0) return fail('Version (e.g. 2.0.0) and a positive integer version_code are required.', 400);
-    const old = await get(env, 'SELECT * FROM cx_releases WHERE package_name = ? ORDER BY version_code DESC LIMIT 1', pkg);
-    if (old && code < Number(old.version_code)) return fail('version_code cannot be lower than the current release.', 409);
+    const dup = await get(env, 'SELECT id FROM cx_releases WHERE package_name = ? AND version_code = ?', pkg, code);
+    if (dup) return fail('That build number already exists. Edit that release instead of creating a new one.', 409);
+    const latest = await get(env, 'SELECT version_code FROM cx_releases WHERE package_name = ? ORDER BY version_code DESC LIMIT 1', pkg);
+    if (latest && code < Number(latest.version_code)) return fail('version_code cannot be lower than the current release.', 409);
     const record = {
       package_name: pkg, title, description: str(b.description || '', 2000),
       version, version_code: code,
@@ -600,17 +602,22 @@ export async function controlRoutes(ctx) {
       const status = await releaseStatus(env, { ...record, package_name: pkg });
       if (!status.available) return fail('Cannot publish without a downloadable APK. Upload one first (or set a working https apk_url).', 422);
     }
-    let saved;
-    if (old) {
-      await update(env, 'cx_releases', { ...record, id: undefined }, 'id = ?', old.id);
-      saved = await get(env, 'SELECT * FROM cx_releases WHERE id = ?', old.id);
-    } else {
-      const id = uuid();
-      await insert(env, 'cx_releases', { id, ...record, created_at: nowIso() });
-      saved = await get(env, 'SELECT * FROM cx_releases WHERE id = ?', id);
-    }
-    await auditOp(env, op, old ? 'update release' : 'create release', 'release', saved.id, { package_name: pkg, version, version_code: code, published: record.published });
-    return json({ ok: true, release: { ...saved, download_available: (await releaseStatus(env, saved)).available } }, old ? 200 : 201);
+    const id = uuid();
+    await insert(env, 'cx_releases', { id, ...record, created_at: nowIso() });
+    const saved = await get(env, 'SELECT * FROM cx_releases WHERE id = ?', id);
+    await auditOp(env, op, 'create release', 'release', saved.id, { package_name: pkg, version, version_code: code, published: record.published });
+    return json({ ok: true, release: { ...saved, download_available: (await releaseStatus(env, saved)).available } }, 201);
+  }
+  if (path === 'control/releases/discard' && method === 'POST') {
+    if (!ownerOnly(op)) return fail('Only the owner can discard uploads.', 403);
+    const b = await body();
+    const key = str(b.apk_r2_key || '', 500);
+    if (!apkKey({ apk_r2_key: key, package_name: key.split('/')[1] || '' })) return fail('Invalid APK key.', 400);
+    const used = await get(env, 'SELECT id FROM cx_releases WHERE apk_r2_key = ?', key);
+    if (used) return fail('That file is already attached to a release.', 409);
+    const bucket = getReleaseBucket(env);
+    if (bucket) { try { await bucket.delete(key); } catch {} }
+    return json({ ok: true, discarded: true });
   }
   if (path === 'control/releases/upload' && method === 'POST') {
     if (!ownerOnly(op)) return fail('Only the owner can upload APKs.', 403);
@@ -644,6 +651,11 @@ export async function controlRoutes(ctx) {
     if (!rel) return fail('Release not found.', 404);
     if (method === 'DELETE') {
       await run(env, 'DELETE FROM cx_releases WHERE id = ?', id);
+      if (rel.apk_r2_key) {
+        const still = await get(env, 'SELECT id FROM cx_releases WHERE apk_r2_key = ?', rel.apk_r2_key);
+        const bucket = getReleaseBucket(env);
+        if (!still && bucket) { try { await bucket.delete(rel.apk_r2_key); } catch {} }
+      }
       await auditOp(env, op, 'delete release', 'release', id, { package_name: rel.package_name, version: rel.version });
       return json({ ok: true, deleted: true });
     }
@@ -661,54 +673,26 @@ export async function controlRoutes(ctx) {
     if (b.published !== undefined) patch.published = b.published ? 1 : 0;
     if (b.release_notes !== undefined) patch.release_notes = str(b.release_notes, 5000);
     if (b.apk_url !== undefined) patch.apk_url = str(b.apk_url, 500);
+    if (b.apk_r2_key !== undefined) {
+      const key = str(b.apk_r2_key || '', 500);
+      if (key && !apkKey({ apk_r2_key: key, package_name: rel.package_name })) return fail('APK storage key must belong to this package.', 400);
+      patch.apk_r2_key = key || null;
+    }
+    if (b.apk_filename !== undefined) patch.apk_filename = str(b.apk_filename, 180);
+    if (b.apk_size_bytes !== undefined) patch.apk_size_bytes = Math.max(0, Number(b.apk_size_bytes || 0));
     if (patch.published === 1 || (patch.published === undefined && bool(rel.published))) {
       const status = await releaseStatus(env, { ...rel, ...patch });
       if (!status.available) return fail('Cannot keep published without a downloadable APK.', 422);
     }
     await update(env, 'cx_releases', patch, 'id = ?', id);
+    if (patch.apk_r2_key !== undefined && rel.apk_r2_key && patch.apk_r2_key !== rel.apk_r2_key) {
+      const still = await get(env, 'SELECT id FROM cx_releases WHERE apk_r2_key = ?', rel.apk_r2_key);
+      const bucket = getReleaseBucket(env);
+      if (!still && bucket) { try { await bucket.delete(rel.apk_r2_key); } catch {} }
+    }
     await auditOp(env, op, 'update release', 'release', id, { fields: Object.keys(b) });
     const saved = await get(env, 'SELECT * FROM cx_releases WHERE id = ?', id);
     return json({ ok: true, release: { ...saved, download_available: (await releaseStatus(env, saved)).available } });
-  }
-
-  /* ---------------- SIM carrier catalog ------------------------------- */
-  if (path === 'control/carriers' && method === 'GET')
-    return json(await all(env, 'SELECT * FROM cx_sim_carriers ORDER BY carrier_name ASC'));
-  if (path === 'control/carriers' && method === 'POST') {
-    const b = await body();
-    const name = str(b.carrier_name || '', 120);
-    if (!name) return fail('Carrier name is required.', 400);
-    const mcc = str(b.mcc_mnc || '').replace(/\D/g, '');
-    if (mcc && !/^\d{5,6}$/.test(mcc)) return fail('MCC/MNC must be 5-6 digits.', 400);
-    const ussd = str(b.balance_ussd_code || '', 32);
-    if (ussd && !/^\*[\d*#]+#$/.test(ussd)) return fail('USSD code must look like *123#.', 400);
-    const id = uuid();
-    await insert(env, 'cx_sim_carriers', {
-      id, carrier_name: name, carrier_identifier: str(b.carrier_identifier || '', 120) || null,
-      mcc_mnc: mcc || null, balance_ussd_code: ussd || null,
-      balance_pattern: str(b.balance_pattern || '', 200) || null,
-      active: b.active === undefined ? 1 : (b.active ? 1 : 0),
-      created_at: nowIso(), updated_at: nowIso()
-    });
-    await auditOp(env, op, 'add SIM carrier', 'carrier', id, { carrier_name: name });
-    return json({ ok: true, carrier: await get(env, 'SELECT * FROM cx_sim_carriers WHERE id = ?', id) }, 201);
-  }
-  if (path.match(/^control\/carriers\/[^/]+$/) && ['PATCH', 'DELETE'].includes(method)) {
-    const id = decodeURIComponent(path.split('/')[2]);
-    const c = await get(env, 'SELECT * FROM cx_sim_carriers WHERE id = ?', id);
-    if (!c) return fail('Carrier not found.', 404);
-    if (method === 'DELETE') {
-      await run(env, 'DELETE FROM cx_sim_carriers WHERE id = ?', id);
-      await auditOp(env, op, 'delete SIM carrier', 'carrier', id, { carrier_name: c.carrier_name });
-      return json({ ok: true, deleted: true });
-    }
-    const b = await body();
-    const patch = { updated_at: nowIso() };
-    for (const k of ['carrier_name', 'carrier_identifier', 'mcc_mnc', 'balance_ussd_code', 'balance_pattern'])
-      if (b[k] !== undefined) patch[k] = str(b[k], 200) || null;
-    if (b.active !== undefined) patch.active = b.active ? 1 : 0;
-    await update(env, 'cx_sim_carriers', patch, 'id = ?', id);
-    return json({ ok: true, carrier: await get(env, 'SELECT * FROM cx_sim_carriers WHERE id = ?', id) });
   }
 
   /* ---------------- settings ------------------------------------------ */

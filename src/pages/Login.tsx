@@ -39,13 +39,13 @@ export default function Login({ setupMode }: { setupMode: boolean }) {
           <p>
             {setupMode
               ? 'Create the platform owner account. This runs once — ConnectX is fully independent from any other product.'
-              : 'Independent communication gateway platform · Gateways, message jobs, apps and releases.'}
+              : 'Connect a product once. Approve the Android phone. SMS results come back on their own.'}
           </p>
         </div>
         {error && <div className="form-error">{error}</div>}
         {setupMode && (
           <div className="form-note">
-            First run detected. Owner accounts can manage apps, API keys and releases; operator accounts manage gateways and messages.
+            First run detected. This creates the ConnectX owner. Products connect later from Connect App — there are no API keys.
           </div>
         )}
         <form onSubmit={onSubmit}>
@@ -69,7 +69,7 @@ export default function Login({ setupMode }: { setupMode: boolean }) {
             {busy ? 'Please wait…' : setupMode ? 'Create owner account' : 'Sign in'}
           </Button>
         </form>
-        <div className="login-foot">ConnectX v2 · powered by Dexter Studio</div>
+        <div className="login-foot">Connect App · powered by Dexter Studio</div>
       </div>
     </div>
   );

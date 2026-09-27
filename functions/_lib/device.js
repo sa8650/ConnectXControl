@@ -554,30 +554,6 @@ export async function deviceRoutes(ctx) {
     return json({ ok: true });
   }
 
-  if (path === 'device/sim-carrier' && method === 'GET') {
-    const params = url.searchParams;
-    const numeric = str(params.get('mccMnc') || '').replace(/\D/g, '');
-    const identifier = str(params.get('carrierName') || '').toLowerCase();
-    if (numeric && !/^\d{5,6}$/.test(numeric)) return fail('Invalid MCC/MNC.', 400);
-    if (!numeric && !identifier) return json({ supported: false });
-    const rows = await all(env, 'SELECT * FROM cx_sim_carriers');
-    const exact = numeric ? rows.find(r => r.mcc_mnc === numeric) : null;
-    const byName = !exact && identifier
-      ? rows.filter(r => !r.mcc_mnc && String(r.carrier_identifier || r.carrier_name || '').toLowerCase() === identifier)
-      : [];
-    const match = exact || (byName.length === 1 ? byName[0] : null);
-    if (!match || !bool(match.active) || !match.balance_ussd_code) return json({ supported: false });
-    return json({
-      supported: true,
-      carrier: {
-        carrier_name: match.carrier_name,
-        mcc_mnc: match.mcc_mnc,
-        balance_ussd_code: match.balance_ussd_code,
-        balance_pattern: match.balance_pattern
-      }
-    });
-  }
-
   if (path === 'device/test' && method === 'POST') {
     const b = await body();
     await touchDevice(env, device.id, { status: b.ok === false ? 'pending_test' : 'active' });

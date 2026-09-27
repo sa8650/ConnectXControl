@@ -132,41 +132,44 @@ function PublishForm({ release, onClose, onSaved }: { release: Release | null; o
     mandatory: !!release?.mandatory,
     published: !!release?.published
   });
-  const [apkKey, setApkKey] = useState(release?.apk_r2_key || '');
-  const [apkMeta, setApkMeta] = useState<{ name: string; size: number } | null>(
-    release ? { name: release.apk_filename, size: release.apk_size_bytes } : null);
+  const [pendingFile, setPendingFile] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
-  const [uploading, setUploading] = useState(false);
-
-  async function uploadApk(file: File) {
-    setUploading(true);
-    try {
-      const fd = new FormData();
-      fd.append('file', file);
-      fd.append('package_name', form.package_name);
-      const res = await api.upload<{ apk_r2_key: string; filename: string; size_bytes: number }>('control/releases/upload', fd);
-      setApkKey(res.apk_r2_key);
-      setApkMeta({ name: res.filename, size: res.size_bytes });
-      toast('APK uploaded to ConnectX storage');
-    } catch (e: any) { toast(e?.message || 'Upload failed', 'err'); }
-    finally { setUploading(false); }
-  }
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
     setBusy(true);
+    let uploadedKey = '';
     try {
-      await api.post('control/releases', {
+      let apk_r2_key = release?.apk_r2_key || '';
+      let apk_filename = release?.apk_filename || `${form.package_name}-${form.version}.apk`;
+      let apk_size_bytes = release?.apk_size_bytes || 0;
+      if (pendingFile) {
+        const fd = new FormData();
+        fd.append('file', pendingFile);
+        fd.append('package_name', form.package_name);
+        const res = await api.upload<{ apk_r2_key: string; filename: string; size_bytes: number }>('control/releases/upload', fd);
+        uploadedKey = res.apk_r2_key;
+        apk_r2_key = res.apk_r2_key;
+        apk_filename = res.filename;
+        apk_size_bytes = res.size_bytes;
+      }
+      const payload = {
         ...form,
         version_code: Number(form.version_code),
-        apk_r2_key: apkKey || undefined,
-        apk_filename: apkMeta?.name || `${form.package_name}-${form.version}.apk`,
-        apk_size_bytes: apkMeta?.size || 0
-      });
+        apk_r2_key: apk_r2_key || undefined,
+        apk_filename,
+        apk_size_bytes
+      };
+      if (release) await api.patch(`control/releases/${release.id}`, payload);
+      else await api.post('control/releases', payload);
       toast(form.published ? 'Release published' : 'Release saved as draft');
       onSaved();
-    } catch (err: any) { toast(err?.message || 'Failed', 'err'); }
-    finally { setBusy(false); }
+    } catch (err: any) {
+      if (uploadedKey) {
+        await api.post('control/releases/discard', { apk_r2_key: uploadedKey }).catch(() => {});
+      }
+      toast(err?.message || 'Failed', 'err');
+    } finally { setBusy(false); }
   }
 
   return (
@@ -188,9 +191,9 @@ function PublishForm({ release, onClose, onSaved }: { release: Release | null; o
             <Input type="number" min={1} value={form.version_code} onChange={e => setForm({ ...form, version_code: e.target.value })} placeholder="18" required />
           </Field>
         </div>
-        <Field label="Signed APK" hint={apkMeta ? `Selected: ${apkMeta.name} (${fmtBytes(apkMeta.size)})` : 'Upload the signed release APK (stored in ConnectX R2).'}>
+        <Field label="Signed APK" hint={pendingFile ? `Will upload on save: ${pendingFile.name} (${fmtBytes(pendingFile.size)})` : release?.apk_filename ? `Current file stays until you choose a new one: ${release.apk_filename}` : 'The file is uploaded only when you create or save the release.'}>
           <input ref={fileRef} type="file" accept=".apk" className="input"
-            onChange={e => { const f = e.target.files?.[0]; if (f) uploadApk(f); }} />
+            onChange={e => setPendingFile(e.target.files?.[0] || null)} />
         </Field>
         <Field label="…or external HTTPS APK URL" hint="Alternative to the upload (e.g. your own CDN). Leave empty when uploading.">
           <Input value={form.apk_url} onChange={e => setForm({ ...form, apk_url: e.target.value })} placeholder="https://cdn.example.com/ConnectX-2.0.0.apk" />
@@ -209,8 +212,8 @@ function PublishForm({ release, onClose, onSaved }: { release: Release | null; o
           <input type="checkbox" checked={form.published} onChange={e => setForm({ ...form, published: e.target.checked })} />
           Publish immediately (requires a downloadable APK)
         </label>
-        {uploading && <p className="muted">Uploading APK…</p>}
-        <Button type="submit" disabled={busy || uploading}>{busy ? 'Saving…' : release ? 'Save release' : 'Create release'}</Button>
+        {busy && <p className="muted">Saving release…</p>}
+        <Button type="submit" disabled={busy}>{busy ? 'Saving…' : release ? 'Save release' : 'Create release'}</Button>
       </form>
     </Modal>
   );

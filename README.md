@@ -10,12 +10,11 @@ ConnectX Control is a complete, self-contained product:
 - ✉️ **Email gateway** — configure Brevo (or Resend / SendGrid / Mailgun / Postmark) once in Settings; every connected system sends email through `POST /api/client/v1/email/send` and never needs its own SMTP setup. Sent mail is recorded for the website and the gateway phones.
 - 🗄️ **Own database** — Cloudflare D1 (`schema/connectx_schema.sql`). No shared tables, no shared sessions with any other product.
 
-> **Relationship to EMS:** none at runtime in either direction. EMS is not modified and not
-> required. When you are ready, EMS (or any product) is connected **from this website**:
-> set its API URL under **Systems & API Keys** (used server-side for federated admin
-> sign-in + shop sync), issue it an API key, and it calls `POST /api/client/v1/sms` /
-> `email/send` with its `shop` reference. Every job is shop-scoped work with a
-> `system_key` label; results are pushed back to the system's webhook.
+> **Relationship to EMS:** none at the database. Connect EMS once from **Connect App**
+> (paste this site’s Connect Endpoint into EMS, then approve the pairing code here).
+> SMS travels EMS Connect Server → this Connect Server → the Android app → the selected SIM.
+> The phone’s server address is compiled into the app and is not shown in the UI.
+> See [CONNECT_APP.md](CONNECT_APP.md).
 
 ## Stack
 

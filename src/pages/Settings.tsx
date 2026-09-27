@@ -12,12 +12,12 @@ export default function Settings() {
 
   return (
     <>
-      <PageHead title="Settings" subtitle="Your account, the Android SMS gateway, email sending for connected systems, and platform accounts." />
+      <PageHead title="Settings" subtitle="Your account and platform accounts. Products connect from Connect App." />
       <div className="grid grid-2">
         <ProfileCard operator={operator!} onSaved={refresh} />
         <PasswordCard />
       </div>
-      <SmsSettingsCard />
+      <TestSmsTemplateCard />
       {isOwner && <EmailCard />}
       {isOwner && <OperatorsCard />}
     </>
@@ -71,49 +71,39 @@ function PasswordCard() {
   );
 }
 
-function SmsSettingsCard() {
-  const [settings, setSettings] = useState<any>(null);
-  const [templates, setTemplates] = useState<Record<string, string>>({});
-  const [enabled, setEnabled] = useState(true);
+function TestSmsTemplateCard() {
+  const [template, setTemplate] = useState('');
+  const [ready, setReady] = useState(false);
   const [busy, setBusy] = useState(false);
-  const KEYS = ['SALE', 'PAYMENT', 'DUE_REMINDER', 'RETURN', 'EXCHANGE', 'REFUND', 'TEST'];
 
   const load = useCallback(async () => {
     const s = await api.get<any>('control/settings');
-    setSettings(s);
-    setEnabled(s?.sms?.enabled !== false);
-    setTemplates({ ...(s?.defaultTemplates || {}), ...(s?.sms?.templates || {}) });
+    const saved = s?.sms?.templates?.TEST;
+    const fallback = s?.defaultTemplates?.TEST || 'ConnectX test from {shop}. Your SMS gateway is working.';
+    setTemplate(saved || fallback);
+    setReady(true);
   }, []);
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => { load().catch(() => setReady(true)); }, [load]);
 
   async function save() {
     setBusy(true);
     try {
-      await api.patch('control/settings', { sms: { enabled, templates } });
-      toast('SMS settings saved');
-      const s = await api.get<any>('control/settings'); setSettings(s);
+      const s = await api.get<any>('control/settings');
+      const templates = { ...(s?.sms?.templates || {}), TEST: template };
+      await api.patch('control/settings', { sms: { templates } });
+      toast('Test SMS template saved');
     } catch (e: any) { toast(e?.message || 'Failed', 'err'); }
     finally { setBusy(false); }
   }
 
   return (
-    <Card title="SMS gateway & templates (Android app)"
-      subtitle="Switch the Android SMS gateway on or off for the whole platform, and edit the templates rendered when a system sends a typed event (SALE, PAYMENT, …) without a message body. {shop} renders the sending shop's name.">
-      {settings === null ? <Empty>Loading…</Empty> : (
+    <Card title="Test SMS template" subtitle="Used when a connected shop sends a test SMS. {shop} is the shop name.">
+      {!ready ? <Empty>Loading…</Empty> : (
         <>
-          <label className="checkbox" style={{ margin: '0 0 10px' }}>
-            <input type="checkbox" checked={enabled} onChange={e => setEnabled(e.target.checked)} />
-            SMS gateway enabled (all systems & shops)
-          </label>
-          <p className="muted">
-            Placeholders: <span className="mono">{'{name} {shop} {invoice} {total} {paid} {due} {amount} {currency}'}</span>
-          </p>
-          {KEYS.map(k => (
-            <Field key={k} label={k}>
-              <TextArea value={templates[k] || ''} onChange={e => setTemplates({ ...templates, [k]: e.target.value })} />
-            </Field>
-          ))}
-          <Button onClick={save} disabled={busy}>{busy ? 'Saving…' : 'Save SMS settings'}</Button>
+          <Field label="TEST">
+            <TextArea value={template} onChange={e => setTemplate(e.target.value)} />
+          </Field>
+          <Button onClick={save} disabled={busy}>{busy ? 'Saving…' : 'Save test template'}</Button>
         </>
       )}
     </Card>
@@ -183,7 +173,7 @@ function EmailCard() {
 
   return (
     <Card title="Email sending (provider)"
-      subtitle="Connected systems send email through ConnectX with POST /api/client/v1/email/send — no system needs its own SMTP or Brevo setup. Sent mail appears in Messages here and on gateway phones.">
+      subtitle="Optional email provider for ConnectX itself. Product SMS does not use this — EMS sends its own email, and SMS travels through Connect App.">
       {cfg === null ? <Empty>Loading…</Empty> : (
         <form onSubmit={save}>
           <div className="grid grid-2">
@@ -264,7 +254,7 @@ function OperatorsCard() {
   }
 
   return (
-    <Card title="Platform accounts" subtitle="Owner accounts manage systems, keys and releases. Operator accounts manage gateways, shops and messages."
+    <Card title="Platform accounts" subtitle="Owner accounts manage releases and operators. Operator accounts can approve Connect App requests and watch messages."
       actions={<Button onClick={() => setOpen(true)}>＋ Add account</Button>}>
       {rows === null ? <Empty>Loading…</Empty> : rows.length === 0 ? <Empty>No accounts found.</Empty> : (
         <div className="table-wrap">
@@ -299,7 +289,7 @@ function OperatorsCard() {
             <Field label="Role">
               <Select value={form.role} onChange={e => setForm({ ...form, role: e.target.value })}>
                 <option value="operator">Operator — gateways, shops, messages</option>
-                <option value="owner">Owner — everything incl. systems, keys, releases</option>
+                <option value="owner">Owner — releases and accounts</option>
               </Select>
             </Field>
             <Button type="submit" disabled={busy}>{busy ? 'Creating…' : 'Create account'}</Button>

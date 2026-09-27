@@ -1,4 +1,6 @@
 import React, { useEffect, useState } from 'react';
+import { Button as KitButton } from './ui/button';
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from './ui/dialog';
 
 /* ---------- Card ---------- */
 export function Card({ title, subtitle, actions, children, className = '' }: {
@@ -46,15 +48,22 @@ export function Badge({ value, tone }: { value: string; tone?: string }) {
 }
 
 /* ---------- Buttons ---------- */
+const KIT_VARIANT = {
+  primary: 'default',
+  ghost: 'ghost',
+  danger: 'destructive',
+  soft: 'secondary'
+} as const;
+
 export function Button({ children, onClick, variant = 'primary', disabled, type = 'button', title }: {
   children: React.ReactNode; onClick?: (e: React.MouseEvent) => void;
   variant?: 'primary' | 'ghost' | 'danger' | 'soft'; disabled?: boolean;
   type?: 'button' | 'submit'; title?: string;
 }) {
   return (
-    <button type={type} title={title} className={`btn btn-${variant}`} disabled={disabled} onClick={onClick}>
+    <KitButton type={type} title={title} variant={KIT_VARIANT[variant]} disabled={disabled} onClick={onClick}>
       {children}
-    </button>
+    </KitButton>
   );
 }
 
@@ -79,21 +88,15 @@ export const Select = (props: React.SelectHTMLAttributes<HTMLSelectElement>) =>
 export function Modal({ title, onClose, children, wide }: {
   title: string; onClose: () => void; children: React.ReactNode; wide?: boolean;
 }) {
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
   return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <div className={`modal ${wide ? 'modal-wide' : ''}`} onClick={e => e.stopPropagation()}>
-        <header className="modal-head">
-          <h3>{title}</h3>
-          <button className="icon-btn" onClick={onClose} aria-label="Close">✕</button>
-        </header>
-        <div className="modal-body">{children}</div>
-      </div>
-    </div>
+    <Dialog open onOpenChange={open => { if (!open) onClose(); }}>
+      <DialogContent className={wide ? 'sm:max-w-3xl' : undefined}>
+        <DialogHeader>
+          <DialogTitle>{title}</DialogTitle>
+        </DialogHeader>
+        {children}
+      </DialogContent>
+    </Dialog>
   );
 }
 

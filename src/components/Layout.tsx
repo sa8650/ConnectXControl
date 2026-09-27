@@ -3,14 +3,11 @@ import { NavLink, useNavigate } from 'react-router-dom';
 import { useAuth } from '../auth/AuthContext';
 
 const NAV = [
-  { to: '/', label: 'Dashboard', icon: '◧', end: true },
-  { to: '/devices', label: 'Gateways', icon: '▣' },
-  { to: '/jobs', label: 'Messages', icon: '≡' },
-  { to: '/shops', label: 'Shops', icon: '◈' },
-  { to: '/systems', label: 'Systems & API Keys', icon: '⚿' },
+  { to: '/', label: 'Dashboard', icon: '◻', end: true },
+  { to: '/connect', label: 'Connect App', icon: '⚭' },
+  { to: '/phones', label: 'Android Phones', icon: '▣' },
+  { to: '/jobs', label: 'Messages', icon: '✎' },
   { to: '/releases', label: 'App Releases', icon: '↥' },
-  { to: '/carriers', label: 'SIM Carriers', icon: '◉' },
-  { to: '/api-docs', label: 'API Docs', icon: '⌘' },
   { to: '/activity', label: 'Activity', icon: '⧗' },
   { to: '/settings', label: 'Settings', icon: '⚙' }
 ];
@@ -19,20 +16,14 @@ export function Logo({ small }: { small?: boolean }) {
   return (
     <div className={`logo ${small ? 'logo-sm' : ''}`}>
       <svg viewBox="0 0 64 64" width={small ? 26 : 34} height={small ? 26 : 34} aria-hidden>
-        <defs>
-          <linearGradient id="lg" x1="0" y1="0" x2="1" y2="1">
-            <stop offset="0" stopColor="#6366f1" />
-            <stop offset="1" stopColor="#06b6d4" />
-          </linearGradient>
-        </defs>
-        <rect width="64" height="64" rx="14" fill="url(#lg)" />
-        <path d="M24 20 L14 32 L24 44" fill="none" stroke="#fff" strokeWidth="5" strokeLinecap="round" strokeLinejoin="round" />
-        <path d="M40 20 L50 32 L40 44" fill="none" stroke="#fff" strokeWidth="5" strokeLinecap="round" strokeLinejoin="round" />
-        <circle cx="32" cy="32" r="4" fill="#fff" />
+        <rect width="64" height="64" rx="16" fill="#0e6b56" />
+        <path d="M18 40 V24 h8 a8 8 0 0 1 0 16z" fill="none" stroke="#f3efe6" strokeWidth="3.2" />
+        <circle cx="44" cy="24" r="4" fill="#e7b089" />
+        <path d="M40 32 h10 M45 27 v10" stroke="#f3efe6" strokeWidth="3" strokeLinecap="round" />
       </svg>
       <div className="logo-text">
         <strong>ConnectX</strong>
-        <span>Control</span>
+        <span>Connect App</span>
       </div>
     </div>
   );
