@@ -1,0 +1,24 @@
+@tailwind components;
+@tailwind utilities;
+
+/* ConnectX indigo-to-cyan component tokens. Preflight stays off for the existing shell. */
+:root {
+  --background: 228 100% 98%;
+  --foreground: 233 40% 13%;
+  --card: 0 0% 100%;
+  --card-foreground: 233 40% 13%;
+  --primary: 239 84% 67%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 187 80% 94%;
+  --secondary-foreground: 237 55% 40%;
+  --muted: 226 45% 96%;
+  --muted-foreground: 226 16% 49%;
+  --accent: 228 84% 96%;
+  --accent-foreground: 238 66% 42%;
+  --destructive: 0 78% 53%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 226 28% 89%;
+  --input: 226 28% 89%;
+  --ring: 239 69% 62%;
+  --radius: 0.625rem;
+}
